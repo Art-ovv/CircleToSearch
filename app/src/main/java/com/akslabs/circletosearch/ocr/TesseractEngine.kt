@@ -21,6 +21,9 @@ object TesseractEngine {
     private const val TAG = "TesseractEngine"
     private var isPrepared = false
 
+    // Default languages: eng + rus for Cyrillic support
+    private val defaultLanguages = listOf("eng", "rus")
+
     fun prepareTessData(context: Context): String {
         val filesDir = context.filesDir.absolutePath
         val tessDir = File(filesDir, "tessdata")
@@ -28,17 +31,20 @@ object TesseractEngine {
             tessDir.mkdirs()
         }
 
-        val engFile = File(tessDir, "eng.traineddata")
-        if (!engFile.exists()) {
-            Log.d(TAG, "Copying eng.traineddata from assets...")
-            try {
-                context.assets.open("tessdata/eng.traineddata").use { input ->
-                    FileOutputStream(engFile).use { output ->
-                        input.copyTo(output)
+        // Copy default models
+        for (lang in defaultLanguages) {
+            val langFile = File(tessDir, "$lang.traineddata")
+            if (!langFile.exists()) {
+                Log.d(TAG, "Copying $lang.traineddata from assets...")
+                try {
+                    context.assets.open("tessdata/$lang.traineddata").use { input ->
+                        FileOutputStream(langFile).use { output ->
+                            input.copyTo(output)
+                        }
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to copy $lang.traineddata: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to copy eng.traineddata: ${e.message}")
             }
         }
         isPrepared = true
@@ -50,11 +56,75 @@ object TesseractEngine {
         if (!dir.exists()) {
             prepareTessData(context)
         }
-        
+
         val files = dir.listFiles() ?: return listOf("eng")
-        return files.filter { it.name.endsWith(".traineddata") }
+        val available = files.filter { it.name.endsWith(".traineddata") }
             .map { it.name.removeSuffix(".traineddata") }
             .sorted()
+
+        // Fallback to eng if no models found
+        return available.ifEmpty { listOf("eng") }
+    }
+
+    /**
+     * Automatically detects language based on system settings.
+     * Returns preferred language for OCR.
+     */
+    fun getSystemLanguage(): String {
+        val systemLang = java.util.Locale.getDefault().language
+        return when (systemLang) {
+            "ru", "uk", "be", "kk" -> "rus+eng" // Combine Cyrillic and Latin for mixed text support
+            else -> "eng"
+        }
+    }
+
+    /**
+     * Returns language for OCR - either system default or user saved.
+     */
+    fun getOcrLanguage(context: Context): String {
+        val prefs = context.getSharedPreferences("OcrSettings", Context.MODE_PRIVATE)
+        var savedLang = prefs.getString("selected_lang", "")
+
+        // Auto-upgrade legacy single language choice to dual language
+        if (savedLang == "rus") {
+            savedLang = "rus+eng"
+            prefs.edit().putString("selected_lang", savedLang).apply()
+        }
+
+        // Use system language if no user selection
+        if (savedLang.isNullOrEmpty()) {
+            val systemLang = getSystemLanguage()
+            // Save system language as default
+            prefs.edit().putString("selected_lang", systemLang).apply()
+            return systemLang
+        }
+
+        return savedLang
+    }
+
+    /**
+     * Checks if model is available for specified language.
+     */
+    fun isModelAvailable(context: Context, lang: String): Boolean {
+        val tessDir = File(context.filesDir, "tessdata")
+        // Support combined languages like "rus+eng"
+        return lang.split("+").all { File(tessDir, "$it.traineddata").exists() }
+    }
+
+    /**
+     * Checks for Russian model and offers download if missing.
+     */
+    fun checkAndOfferRussianModel(context: Context): Boolean {
+        if (isModelAvailable(context, "rus")) return true
+
+        val prefs = context.getSharedPreferences("OcrSettings", Context.MODE_PRIVATE)
+        val offerShown = prefs.getBoolean("rus_model_offer_shown", false)
+
+        if (!offerShown) {
+            prefs.edit().putBoolean("rus_model_offer_shown", true).apply()
+            return false
+        }
+        return false
     }
 
     fun importModel(context: Context, uri: android.net.Uri, callback: (Boolean, String) -> Unit) {
@@ -100,8 +170,8 @@ object TesseractEngine {
      */
     suspend fun extractText(context: Context, bitmap: Bitmap): List<TextNode> = coroutineScope {
         val dataPath = withContext(Dispatchers.IO) { prepareTessData(context) }
-        val prefs = context.getSharedPreferences("OcrSettings", Context.MODE_PRIVATE)
-        val lang = prefs.getString("selected_lang", "eng") ?: "eng"
+        // Use automatic language detection
+        val lang = getOcrLanguage(context)
 
         val w = bitmap.width
         val h = bitmap.height
