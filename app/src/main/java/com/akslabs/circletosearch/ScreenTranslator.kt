@@ -157,10 +157,12 @@ class ScreenTranslator : Closeable {
     private fun getDominantEdgeColor(bitmap: Bitmap, bounds: Rect): Int {
         val colorCounts = mutableMapOf<Int, Int>()
 
-        val left = bounds.left.coerceIn(0, bitmap.width - 1)
-        val right = bounds.right.coerceIn(0, bitmap.width - 1)
-        val top = bounds.top.coerceIn(0, bitmap.height - 1)
-        val bottom = bounds.bottom.coerceIn(0, bitmap.height - 1)
+        // ОПТИМИЗАЦИЯ: Расширяем рамку наружу (padding), чтобы сойти со шрифта на чистый фон.
+        val padding = 4
+        val left = (bounds.left - padding).coerceIn(0, bitmap.width - 1)
+        val right = (bounds.right + padding).coerceIn(0, bitmap.width - 1)
+        val top = (bounds.top - padding).coerceIn(0, bitmap.height - 1)
+        val bottom = (bounds.bottom + padding).coerceIn(0, bitmap.height - 1)
 
         // Edge case: empty or zero rect
         if (right <= left || bottom <= top) {
@@ -243,10 +245,11 @@ class ScreenTranslator : Closeable {
         val luminance = 0.2126 * channelLuminance(r) +
                        0.7152 * channelLuminance(g) +
                        0.0722 * channelLuminance(b)
-        // Contrast ratio against WHITE (1.0) vs BLACK (0.0)
-        val ratioWhite = (luminance + 0.05) / 0.05
-        val ratioBlack = 0.05 / (luminance + 0.05)
-        return if (ratioWhite > ratioBlack) Color.BLACK else Color.WHITE
+        
+        // WCAG Formula: (L1 + 0.05) / (L2 + 0.05) where L1 is the lighter color
+        val contrastWithWhite = 1.05 / (luminance + 0.05)
+        val contrastWithBlack = (luminance + 0.05) / 0.05
+        return if (contrastWithBlack > contrastWithWhite) Color.BLACK else Color.WHITE
     }
     
     override fun close() {
