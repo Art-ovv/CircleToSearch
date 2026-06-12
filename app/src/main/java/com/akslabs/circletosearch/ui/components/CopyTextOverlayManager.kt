@@ -249,6 +249,48 @@ class CopyTextOverlayManager(
         private var toolbarInitialized = false
         private var lastTouchX = 0f
         private var lastTouchY = 0f
+        
+        // Allocation-free drawing fields
+        private val tempRect = RectF()
+        private val highlightPath = Path()
+        private val encompassingRect = RectF()
+        private var currentSx = 1f
+        private var currentSy = 1f
+
+        private fun updateSelection(start: Int, end: Int) {
+            globalSelectionStart = start
+            globalSelectionEnd = end
+            recalculateHighlightPath()
+            invalidate()
+        }
+
+        private fun recalculateHighlightPath() {
+            highlightPath.reset()
+            encompassingRect.setEmpty()
+
+            if (globalSelectionStart == -1 || globalSelectionEnd == -1) return
+
+            val start = globalSelectionStart.coerceAtMost(globalSelectionEnd)
+            val end = globalSelectionStart.coerceAtLeast(globalSelectionEnd)
+            val selectedWords = (start..end).mapNotNull { allWords.getOrNull(it) }
+
+            if (selectedWords.isEmpty()) return
+
+            encompassingRect.set(selectedWords.first().bounds)
+            selectedWords.forEach { encompassingRect.union(it.bounds) }
+
+            val sx = if (width > 0) width.toFloat() / (screenshotBitmap?.width?.toFloat() ?: 1f) else 1f
+            val sy = if (height > 0) height.toFloat() / (screenshotBitmap?.height?.toFloat() ?: 1f) else 1f
+
+            selectedWords.groupBy { (it.bounds.centerY() / 20).toInt() }.forEach { (_, wordsInLine) ->
+                if (wordsInLine.isEmpty()) return@forEach
+                val first = wordsInLine.minByOrNull { it.bounds.left } ?: return@forEach
+                val last = wordsInLine.maxByOrNull { it.bounds.right } ?: return@forEach
+                val lineRect = RectF(first.bounds.left, wordsInLine.minOf { it.bounds.top }, last.bounds.right, wordsInLine.maxOf { it.bounds.bottom })
+                lineRect.inset(-8f / sx, -4f / sy)
+                highlightPath.addRoundRect(lineRect, 8f / sx, 8f / sy, Path.Direction.CW)
+            }
+        }
 
         init {
             setLayerType(LAYER_TYPE_SOFTWARE, null)
@@ -270,45 +312,44 @@ class CopyTextOverlayManager(
             val saveCount = canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), null)
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), dimPaint)
 
+            // Use Matrix scaling to avoid allocating RectFs for every word
+            val sx = width.toFloat() / (screenshotBitmap?.width?.toFloat() ?: 1f)
+            val sy = height.toFloat() / (screenshotBitmap?.height?.toFloat() ?: 1f)
+            
+            if (sx != currentSx || sy != currentSy) {
+                currentSx = sx
+                currentSy = sy
+                recalculateHighlightPath()
+            }
+
+            canvas.scale(sx, sy)
+
             textNodes.forEach { node ->
-                val scaledBounds = scaleRect(node.bounds)
-                scaledBounds.inset(-8f, -4f)
-                canvas.drawRoundRect(scaledBounds, 8f, 8f, clearPaint)
+                tempRect.set(node.bounds)
+                tempRect.inset(-8f / sx, -4f / sy)
+                canvas.drawRoundRect(tempRect, 8f / sx, 8f / sy, clearPaint)
             }
 
             if (globalSelectionStart != -1 && globalSelectionEnd != -1) {
                 val start = globalSelectionStart.coerceAtMost(globalSelectionEnd)
                 val end = globalSelectionStart.coerceAtLeast(globalSelectionEnd)
-                val selectedWords = (start..end).mapNotNull { allWords.getOrNull(it) }
-                
-                val highlightPath = Path()
-                selectedWords.groupBy { (it.bounds.centerY() / 20).toInt() }.forEach { (_, wordsInLine) ->
-                    if (wordsInLine.isEmpty()) return@forEach
-                    val first = wordsInLine.minBy { it.bounds.left }
-                    val last = wordsInLine.maxBy { it.bounds.right }
-                    val lineRect = RectF(first.bounds.left, wordsInLine.minOf { it.bounds.top }, last.bounds.right, wordsInLine.maxOf { it.bounds.bottom })
-                    val scaledHighlight = scaleRect(lineRect)
-                    scaledHighlight.inset(-8f, -4f)
-                    highlightPath.addRoundRect(scaledHighlight, 8f, 8f, Path.Direction.CW)
-                }
                 canvas.drawPath(highlightPath, selectedWordPaint)
 
-                val startLocal = scaleRect(allWords[start].bounds)
-                val endLocal = scaleRect(allWords[end].bounds)
-                drawHandle(canvas, startLocal.left, startLocal.top, true)
-                drawHandle(canvas, endLocal.right, endLocal.bottom, false)
+                drawHandle(canvas, allWords[start].bounds.left, allWords[start].bounds.top, true, sx, sy)
+                drawHandle(canvas, allWords[end].bounds.right, allWords[end].bounds.bottom, false, sx, sy)
 
-                val encompassing = RectF(allWords[start].bounds)
-                selectedWords.forEach { encompassing.union(it.bounds) }
-                drawFloatingToolbar(canvas, scaleRect(encompassing))
+                // Re-scale canvas to identity for UI components so they don't get stretched
+                canvas.scale(1/sx, 1/sy)
+                tempRect.set(encompassingRect.left * sx, encompassingRect.top * sy, encompassingRect.right * sx, encompassingRect.bottom * sy)
+                drawFloatingToolbar(canvas, tempRect)
             }
             canvas.restoreToCount(saveCount)
         }
 
-        private fun drawHandle(canvas: Canvas, x: Float, y: Float, isStart: Boolean) {
-            canvas.drawCircle(x, y, 18f, handlePaint)
-            if (isStart) canvas.drawRect(x - 2f, y, x + 2f, y + 40f, handlePaint)
-            else canvas.drawRect(x - 2f, y - 40f, x + 2f, y, handlePaint)
+        private fun drawHandle(canvas: Canvas, x: Float, y: Float, isStart: Boolean, sx: Float = 1f, sy: Float = 1f) {
+            canvas.drawCircle(x, y, 18f / sx, handlePaint)
+            if (isStart) canvas.drawRect(x - 2f / sx, y, x + 2f / sx, y + 40f / sy, handlePaint)
+            else canvas.drawRect(x - 2f / sx, y - 40f / sy, x + 2f / sx, y, handlePaint)
         }
 
         private fun drawFloatingToolbar(canvas: Canvas, anchor: RectF) {
@@ -382,10 +423,10 @@ class CopyTextOverlayManager(
                     }
                     val nearest = findNearestWordGlobal(lx, ly)
                     if (nearest != -1) {
-                        globalSelectionStart = nearest; globalSelectionEnd = nearest
-                        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); invalidate(); return true
+                        updateSelection(nearest, nearest)
+                        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); return true
                     } else { 
-                        globalSelectionStart = -1; globalSelectionEnd = -1; invalidate() 
+                        updateSelection(-1, -1)
                         return false 
                     }
                 }
@@ -396,13 +437,12 @@ class CopyTextOverlayManager(
                     if (dragHandleType != 0) {
                         val nearest = findNearestWordGlobal(lx, ly)
                         if (nearest != -1) {
-                            if (dragHandleType == 1) globalSelectionStart = nearest else globalSelectionEnd = nearest
-                            invalidate()
+                            if (dragHandleType == 1) updateSelection(nearest, globalSelectionEnd) else updateSelection(globalSelectionStart, nearest)
                         }
                         return true
                     } else if (globalSelectionStart != -1) {
                         val nearest = findNearestWordGlobal(lx, ly)
-                        if (nearest != -1) { globalSelectionEnd = nearest; invalidate(); return true }
+                        if (nearest != -1) { updateSelection(globalSelectionStart, nearest); return true }
                     }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {

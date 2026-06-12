@@ -219,9 +219,7 @@ class OverlayActivity : ComponentActivity() {
         copyTextManager.value?.dismiss()
         copyTextManager.value = null
 
-        if (screenshotBitmap.value?.isRecycled == false) {
-            screenshotBitmap.value?.recycle()
-        }
+        // Compose unbinds it naturally, GC handles it
         screenshotBitmap.value = null
 
         if (isFinishing) {
