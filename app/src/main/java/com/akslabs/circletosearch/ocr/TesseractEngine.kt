@@ -24,6 +24,52 @@ object TesseractEngine {
     // Default languages: eng + rus for Cyrillic support
     private val defaultLanguages = listOf("eng", "rus")
 
+    private val latinToCyrillic = mapOf(
+        'A' to 'А', 'a' to 'а',
+        'B' to 'В', 'b' to 'в',
+        'C' to 'С', 'c' to 'с',
+        'E' to 'Е', 'e' to 'е',
+        'H' to 'Н', 'h' to 'н',
+        'K' to 'К', 'k' to 'к',
+        'M' to 'М', 'm' to 'м',
+        'O' to 'О', 'o' to 'о',
+        'P' to 'Р', 'p' to 'р',
+        'T' to 'Т', 't' to 'т',
+        'X' to 'Х', 'x' to 'х',
+        'Y' to 'У', 'y' to 'у',
+        'N' to 'П', 'n' to 'п', // Frequently confused (CHYNA -> СНУПА)
+        'W' to 'Ш', 'w' to 'ш'
+    )
+    private val cyrillicToLatin = latinToCyrillic.entries.associate { (k, v) -> v to k }
+
+    private fun cleanWordText(text: String, lineDominantCyrillic: Boolean): String {
+        // Remove frequent OCR artifacts
+        var t = text.replace("<", "").replace(">", "").replace("|", "").trim()
+        if (t.isEmpty()) return ""
+
+        val cCyr = t.count { it in 'А'..'я' || it == 'Ё' || it == 'ё' }
+        val cLat = t.count { it in 'A'..'Z' || it in 'a'..'z' }
+
+        if (cCyr == 0 && cLat == 0) return t
+
+        if (cCyr > 0 && cLat > 0) {
+            val toCyrillic = cCyr >= cLat
+            t = t.map { char ->
+                if (toCyrillic && latinToCyrillic.containsKey(char)) latinToCyrillic[char]!!
+                else if (!toCyrillic && cyrillicToLatin.containsKey(char)) cyrillicToLatin[char]!!
+                else char
+            }.joinToString("")
+        } else if (lineDominantCyrillic && cLat > 0 && cCyr == 0) {
+            val onlyLookalikes = t.all { !it.isLetter() || latinToCyrillic.containsKey(it) }
+            if (onlyLookalikes) t = t.map { char -> latinToCyrillic[char] ?: char }.joinToString("")
+        } else if (!lineDominantCyrillic && cCyr > 0 && cLat == 0) {
+            val onlyLookalikes = t.all { !it.isLetter() || cyrillicToLatin.containsKey(it) }
+            if (onlyLookalikes) t = t.map { char -> cyrillicToLatin[char] ?: char }.joinToString("")
+        }
+        
+        return t
+    }
+
     fun prepareTessData(context: Context): String {
         val filesDir = context.filesDir.absolutePath
         val tessDir = File(filesDir, "tessdata")
@@ -308,10 +354,14 @@ object TesseractEngine {
                 val prev = currentLine.last()
                 val curr = sortedWords[i]
                 
-                // If vertical centers are close enough, they are on the same line
-                val verticalOverlap = Math.abs(curr.bounds.centerY() - prev.bounds.centerY()) < (prev.bounds.height() * 0.6f)
+                val avgHeight = (curr.bounds.height() + prev.bounds.height()) / 2f
+                val verticalOverlap = Math.abs(curr.bounds.centerY() - prev.bounds.centerY()) < (avgHeight * 0.6f)
                 
-                if (verticalOverlap) {
+                // Prevent multi-column bleeding: Max horizontal gap of ~3.5 character widths
+                val horizontalGap = curr.bounds.left - prev.bounds.right
+                val isCloseHorizontally = horizontalGap < (avgHeight * 3.5f)
+                
+                if (verticalOverlap && isCloseHorizontally) {
                     currentLine.add(curr)
                 } else {
                     currentLine = mutableListOf(curr)
@@ -324,26 +374,48 @@ object TesseractEngine {
         val result = mutableListOf<TextNode>()
         lines.forEach { lineWords ->
             val finalLineWords = lineWords.sortedBy { it.bounds.left }
-            val fullText = finalLineWords.joinToString(" ") { it.text }
             
+            val rawLineText = finalLineWords.joinToString(" ") { it.text }
+            val cCyr = rawLineText.count { it in 'А'..'я' || it == 'Ё' || it == 'ё' }
+            val cLat = rawLineText.count { it in 'A'..'Z' || it in 'a'..'z' }
+            val lineDominantCyrillic = cCyr >= cLat
+            
+            // Проверяем, не написана ли вся строка капсом (чтобы не понижать регистр легальным аббревиатурам)
+            val lettersOnly = rawLineText.filter { it.isLetter() }
+            val lineIsAllCaps = lettersOnly.isNotEmpty() && lettersOnly.all { it.isUpperCase() }
+
+            val cleanedWords = mutableListOf<Word>()
             val lineBounds = Rect()
-            finalLineWords.forEachIndexed { idx, w ->
-                // Re-index words for the line
-                finalLineWords[idx].copy(index = idx) 
                 
-                val r = Rect()
-                w.bounds.roundOut(r)
-                if (lineBounds.isEmpty()) lineBounds.set(r) else lineBounds.union(r)
+            finalLineWords.forEach { w ->
+                var cleanedText = cleanWordText(w.text, lineDominantCyrillic)
+                
+                // Фикс бага OCR с КАПСОМ: если слово длиннее 2 букв и всё из заглавных, но
+                // всё остальное предложение нормальное — Tesseract ошибся. Понижаем регистр.
+                if (!lineIsAllCaps && cleanedText.length > 2 && cleanedText.all { !it.isLetter() || it.isUpperCase() }) {
+                    cleanedText = cleanedText.lowercase()
+                }
+
+                if (cleanedText.isNotBlank()) {
+                    val r = Rect()
+                    w.bounds.roundOut(r)
+                    if (lineBounds.isEmpty()) lineBounds.set(r) else lineBounds.union(r)
+                    
+                    cleanedWords.add(w.copy(index = cleanedWords.size, text = cleanedText))
+                }
             }
 
-            result.add(
-                TextNode(
-                    id = UUID.randomUUID().toString(),
-                    fullText = fullText,
-                    bounds = lineBounds,
-                    words = finalLineWords
+            if (cleanedWords.isNotEmpty()) {
+                val fullText = cleanedWords.joinToString(" ") { it.text }
+                result.add(
+                    TextNode(
+                        id = UUID.randomUUID().toString(),
+                        fullText = fullText,
+                        bounds = lineBounds,
+                        words = cleanedWords
+                    )
                 )
-            )
+            }
         }
         
         return result
