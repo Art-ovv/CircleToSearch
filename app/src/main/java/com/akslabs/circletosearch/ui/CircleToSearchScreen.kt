@@ -47,6 +47,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -84,7 +85,7 @@ import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
@@ -172,6 +173,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.tasks.await
 import androidx.webkit.WebViewFeature
 import com.akslabs.circletosearch.data.isDirectUpload
 import kotlin.math.max
@@ -191,7 +193,8 @@ fun CircleToSearchScreen(
     searchModeOverride: Boolean? = null,
     copyTextManager: com.akslabs.circletosearch.ui.components.CopyTextOverlayManager? = null,
     onCopyText: () -> Unit = {},
-    onExitCopyMode: () -> Unit = {}
+    onExitCopyMode: () -> Unit = {},
+    onTranslate: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -253,16 +256,12 @@ fun CircleToSearchScreen(
     }
     val searchEngines = preferredOrder
     
-    // Copy Mode internal state
-    var isCopyMode by remember { mutableStateOf(false) }
-
     // Support Settings Sheet
     var showSettingsScreen by remember { mutableStateOf(false) }
 
     // Friendly Message State
     var friendlyMessage by remember { mutableStateOf("") }
     var isMessageVisible by remember { mutableStateOf(false) }
-    var isCopyTextTriggered by remember { mutableStateOf(false) }
     
     // Resizing state
     var isResizing by remember { mutableStateOf(false) }
@@ -276,9 +275,12 @@ fun CircleToSearchScreen(
     
     // Phase 44: Smart Entity Extractor
     var isEntityExtractMode by remember { mutableStateOf(false) }
+    var isCopyMode by remember { mutableStateOf(false) }
     var detectedEntities by remember { mutableStateOf<List<SmartEntity>>(emptyList()) }
     var isExtractingEntities by remember { mutableStateOf(false) }
+    var showTranslationLangDialog by remember { mutableStateOf(false) }
     
+
     LaunchedEffect(Unit) {
         if (uiPreferences.isShowFriendlyMessages()) {
             val manager = FriendlyMessageManager(context)
@@ -412,7 +414,6 @@ fun CircleToSearchScreen(
     // Lifecycle reset: When screenshot changes, reset selection and modes
     LaunchedEffect(screenshot) {
         if (screenshot != null) {
-            isCopyMode = false
             selectionRect = null
             selectedBitmap = null
             isSearching = false
@@ -461,15 +462,9 @@ fun CircleToSearchScreen(
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                databaseEnabled = true
                 allowFileAccess = true
                 allowContentAccess = true
-                allowFileAccessFromFileURLs = true
-                allowUniversalAccessFromFileURLs = true
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                
-                // Performance & UI
-                setRenderPriority(WebSettings.RenderPriority.HIGH)
                 
                 // Caching for Speed
                 cacheMode = WebSettings.LOAD_DEFAULT // Was LOAD_CACHE_ELSE_NETWORK - caused refresh issues
@@ -538,11 +533,6 @@ fun CircleToSearchScreen(
 
     // Back Handler Logic
     BackHandler(enabled = true) {
-        if (isCopyMode) {
-            isCopyMode = false
-            onExitCopyMode()
-            return@BackHandler
-        }
         val currentWebView = webViews[selectedEngine]
         if (currentWebView != null && currentWebView.canGoBack()) {
             currentWebView.goBack()
@@ -869,7 +859,6 @@ fun CircleToSearchScreen(
             // Close button for Copy Mode (Top Left)
 
             // Friendly Message Overlay (Top Center)
-            if (!isCopyMode) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -882,10 +871,9 @@ fun CircleToSearchScreen(
                         visible = isMessageVisible
                     )
                 }
-            }
 
             // 1. Screenshot Layer
-            if (screenshot != null && !isCopyMode) {
+            if (screenshot != null) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -940,7 +928,7 @@ fun CircleToSearchScreen(
             }
 
             // 2. Gradient Border Layer (Overlaying screenshot, clipped to rounded corners)
-            if (showGradientBorder && !isCopyMode) {
+            if (showGradientBorder) {
                 androidx.compose.animation.AnimatedVisibility(
                     visible = isUIVisible,
                     enter = androidx.compose.animation.fadeIn(animationSpec = tween(700))
@@ -961,11 +949,11 @@ fun CircleToSearchScreen(
             }
 
             // 3. Drawing Canvas (Interactive Layer)
-            if (!isCopyMode) {                Canvas(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectDragGestures(
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        detectDragGestures(
                                 onDragStart = { offset ->
                                     val rect = selectionRect
                                     if (rect != null && selectionAnim.value == 1f) {
@@ -1162,11 +1150,9 @@ fun CircleToSearchScreen(
                     }
                 }
 
-            }
-
             // 4. Header (Top)
             androidx.compose.animation.AnimatedVisibility(
-                visible = isUIVisible && !isCopyMode && !isEntityExtractMode,
+                visible = isUIVisible && !isEntityExtractMode,
                 enter = androidx.compose.animation.slideInVertically(
                     initialOffsetY = { -it }, // Commence au-dessus de l'écran (-100%)
                     animationSpec = tween(500, easing = androidx.compose.animation.core.FastOutSlowInEasing)
@@ -1313,7 +1299,7 @@ fun CircleToSearchScreen(
                             androidx.compose.material3.DropdownMenuItem(
                                 text = { Text("Open in Browser") },
                                 leadingIcon = {
-                                    Icon(Icons.Default.OpenInNew, contentDescription = null)
+                                    Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
                                 },
                                 onClick = {
                                     val currentUrl = webViews[selectedEngine]?.url ?: searchUrl
@@ -1336,6 +1322,16 @@ fun CircleToSearchScreen(
                                 }
                             )
                             androidx.compose.material3.DropdownMenuItem(
+                                    text = { Text("Translation Target") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Translate, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showTranslationLangDialog = true
+                                        showMenu = false
+                                    }
+                                )
+                                androidx.compose.material3.DropdownMenuItem(
                                 text = { Text("Settings") },
                                 leadingIcon = {
                                     Icon(Icons.Default.Settings, contentDescription = null)
@@ -1350,11 +1346,9 @@ fun CircleToSearchScreen(
                 }
             }
             // 5. Bottom Bar — Material 3 Expressive two-row card
-            // State for Copy Text mode
-            var isCopyTextTriggered by remember { mutableStateOf(false) }
 
             androidx.compose.animation.AnimatedVisibility(
-                visible = isUIVisible && !isCopyMode && !isEntityExtractMode,
+                visible = isUIVisible && !isEntityExtractMode,
                 enter = slideInVertically(
                     initialOffsetY = { it }, // slides up from below
                     animationSpec = tween(300, easing = androidx.compose.animation.core.CubicBezierEasing(0f, 0f, 0.2f, 1f))
@@ -1457,43 +1451,11 @@ fun CircleToSearchScreen(
                                 }
                             }
 
-                            // Circular Button: Assist Copy (Music Icon)
-                            val assistNodes by com.akslabs.circletosearch.data.AssistDataRepository.assistNodes.collectAsState()
-                            val isAssistDataReady by com.akslabs.circletosearch.data.AssistDataRepository.isDataReady.collectAsState()
-
-                            IconButton(
-                                onClick = {
-                                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                    
-                                    if (isAssistDataReady) {
-                                        // Use high-accuracy AssistStructure data + OCR merge
-                                        copyTextManager?.setHybridMode(assistNodes)
-                                        isCopyMode = true
-                                        isCopyTextTriggered = true
-                                    } else {
-                                        // Data not ready (likely bubble trigger)
-                                        android.widget.Toast.makeText(context, "Comming Soon: launch CTS as assistant to try Hybrid text detection.", android.widget.Toast.LENGTH_LONG).show()
-                                    }
-                                },
-                                modifier = Modifier
-                                    .size(60.dp)
-                                    .background(MaterialTheme.colorScheme.surfaceContainer, CircleShape),
-                            ) {
-                                Icon(Icons.Default.MusicNote, contentDescription = "Assist Copy", tint = if (isAssistDataReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                            }
-
                             // Circular Button: Translate
                             IconButton(
                                 onClick = {
                                     haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                    android.widget.Toast.makeText(context, "Coming soon", android.widget.Toast.LENGTH_SHORT).show()
-                                    /*
-                                    try {
-                                        val intent = context.packageManager.getLaunchIntentForPackage("com.google.android.apps.translate")?.apply { addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) }
-                                        if (intent != null) context.startActivity(intent)
-                                        else context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://translate.google.com")).apply { addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) })
-                                    } catch (e: Exception) {}
-                                    */
+                                    onTranslate()
                                 },
                                 modifier = Modifier
                                     .size(60.dp)
@@ -1626,13 +1588,6 @@ fun CircleToSearchScreen(
                                 showDonateSheet = true
                             }
 
-                            // Copy Text
-                            BottomBarButton("Copy Text", { Icon(painterResource(id = com.akslabs.circletosearch.R.drawable.ocr), null, modifier = Modifier.size(20.dp)) }) {
-                                copyTextManager?.setOcrOnlyMode()
-                                isCopyMode = true
-                                isCopyTextTriggered = true
-                            }
-
                             // QR Scan
                             BottomBarButton("Scan QR", { Icon(Icons.Default.QrCode, null) }) {
                                 qrScanBitmap = selectedBitmap ?: screenshot
@@ -1671,12 +1626,11 @@ fun CircleToSearchScreen(
                 )
             }
 
-            // Copy Text overlay integration (Activity-based)
-            if (isCopyMode && copyTextManager != null) {
+            // Seamless Text Selection Overlay integration (Active when in copy mode)
+            if (copyTextManager != null) {
                 AndroidView(
                     factory = { ctx ->
                         copyTextManager.getOverlayView(onDismiss = {
-                            isCopyMode = false
                             onExitCopyMode()
                         })
                     },
@@ -1687,7 +1641,7 @@ fun CircleToSearchScreen(
             }
 
             // 4. Selection Actions (Share) — Positioned at the very end for absolute top-layer rendering
-            if (selectionRect != null && selectionAnim.value == 1f && !isCopyMode) {
+            if (selectionRect != null && selectionAnim.value == 1f) {
                 val rect = selectionRect!!
                 val density = androidx.compose.ui.platform.LocalDensity.current
                 val leftPx = rect.left.toFloat()
@@ -1811,7 +1765,7 @@ fun CircleToSearchScreen(
             }
 
         // --- NEW: QR Overlay Chips (High Layer) ---
-        if (screenshot != null && !isCopyMode) {
+        if (screenshot != null) {
             BoxWithConstraints(modifier = Modifier.fillMaxSize().zIndex(2500f)) {
                 val screenWidth = maxWidth
                 val screenHeight = maxHeight
@@ -1886,7 +1840,7 @@ fun CircleToSearchScreen(
         }
 
         // --- Phase 44: Smart Entity Extractor Overlay Chips ---
-        if (isEntityExtractMode && screenshot != null && !isCopyMode) {
+        if (isEntityExtractMode && screenshot != null) {
             BoxWithConstraints(modifier = Modifier.fillMaxSize().zIndex(2600f)) {
                 val screenWidth = maxWidth
                 val screenHeight = maxHeight
@@ -2049,6 +2003,57 @@ fun CircleToSearchScreen(
             SettingsScreen(
                 uiPreferences = uiPreferences,
                 onDismissRequest = { showSettingsScreen = false }
+            )
+        }
+
+        if (showTranslationLangDialog) {
+            val languages = listOf(
+                null to "Auto (System Default)",
+                "ar" to "Arabic",
+                "zh" to "Chinese",
+                "nl" to "Dutch",
+                "en" to "English",
+                "fr" to "French",
+                "de" to "German",
+                "hi" to "Hindi",
+                "it" to "Italian",
+                "ja" to "Japanese",
+                "ko" to "Korean",
+                "pl" to "Polish",
+                "pt" to "Portuguese",
+                "ru" to "Russian",
+                "es" to "Spanish",
+                "tr" to "Turkish",
+                "uk" to "Ukrainian"
+            )
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showTranslationLangDialog = false },
+                title = { Text("Translate to...") },
+                text = {
+                    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                        val currentSelection = uiPreferences.getTargetTranslateLang()
+                        languages.forEach { (code, name) ->
+                            val isSelected = currentSelection == code
+                            Text(
+                                text = name,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        uiPreferences.setTargetTranslateLang(code)
+                                        showTranslationLangDialog = false
+                                    }
+                                    .padding(vertical = 12.dp, horizontal = 16.dp),
+                                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = { showTranslationLangDialog = false }) {
+                        Text("Close")
+                    }
+                }
             )
         }
     }
