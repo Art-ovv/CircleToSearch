@@ -13,6 +13,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -21,30 +23,33 @@ object TesseractEngine {
     private const val TAG = "TesseractEngine"
     private var isPrepared = false
 
+    // Cache Tesseract instance to avoid loading 30MB+ dictionaries from disk on every scan
+    private var cachedTessApi: TessBaseAPI? = null
+    private var cachedLang: String? = null
+    private val ocrMutex = Mutex()
+
     // Default languages: eng + rus for Cyrillic support
     private val defaultLanguages = listOf("eng", "rus")
 
     private val latinToCyrillic = mapOf(
         'A' to 'А', 'a' to 'а',
-        'B' to 'В', 'b' to 'в',
+        'B' to 'В',
         'C' to 'С', 'c' to 'с',
         'E' to 'Е', 'e' to 'е',
-        'H' to 'Н', 'h' to 'н',
+        'H' to 'Н',
         'K' to 'К', 'k' to 'к',
         'M' to 'М', 'm' to 'м',
         'O' to 'О', 'o' to 'о',
         'P' to 'Р', 'p' to 'р',
         'T' to 'Т', 't' to 'т',
         'X' to 'Х', 'x' to 'х',
-        'Y' to 'У', 'y' to 'у',
-        'N' to 'П', 'n' to 'п', // Frequently confused (CHYNA -> СНУПА)
-        'W' to 'Ш', 'w' to 'ш'
+        'Y' to 'У', 'y' to 'у'
     )
     private val cyrillicToLatin = latinToCyrillic.entries.associate { (k, v) -> v to k }
 
     private fun cleanWordText(text: String, lineDominantCyrillic: Boolean): String {
-        // Remove frequent OCR artifacts
-        var t = text.replace("<", "").replace(">", "").replace("|", "").trim()
+        // Remove frequent OCR artifacts (including noise like "<")
+        var t = text.replace("<", "").replace(">", "").trim()
         if (t.isEmpty()) return ""
 
         val cCyr = t.count { it in 'А'..'я' || it == 'Ё' || it == 'ё' }
@@ -70,8 +75,28 @@ object TesseractEngine {
         return t
     }
 
+    private fun calculateAverageLuminance(bitmap: Bitmap): Float {
+        val stepX = maxOf(1, bitmap.width / 50)
+        val stepY = maxOf(1, bitmap.height / 50)
+        var sumLuminance = 0f
+        var count = 0
+        for (x in 0 until bitmap.width step stepX) {
+            for (y in 0 until bitmap.height step stepY) {
+                val pixel = bitmap.getPixel(x, y)
+                val r = android.graphics.Color.red(pixel)
+                val g = android.graphics.Color.green(pixel)
+                val b = android.graphics.Color.blue(pixel)
+                sumLuminance += (0.299f * r + 0.587f * g + 0.114f * b)
+                count++
+            }
+        }
+        return if (count > 0) sumLuminance / count else 255f
+    }
+
     fun prepareTessData(context: Context): String {
         val filesDir = context.filesDir.absolutePath
+        // OPTIMIZATION: Immediate exit if files are already verified in this session
+        if (isPrepared) return filesDir
         val tessDir = File(filesDir, "tessdata")
         if (!tessDir.exists()) {
             tessDir.mkdirs()
@@ -117,11 +142,9 @@ object TesseractEngine {
      * Returns preferred language for OCR.
      */
     fun getSystemLanguage(): String {
-        val systemLang = java.util.Locale.getDefault().language
-        return when (systemLang) {
-            "ru", "uk", "be", "kk" -> "rus+eng" // Combine Cyrillic and Latin for mixed text support
-            else -> "eng"
-        }
+        // Priority is given to Russian ("rus+eng") to prevent 
+        // Cyrillic words from being converted into lookalike English ones (e.g., "тому" -> "tommy").
+        return "rus+eng"
     }
 
     /**
@@ -129,23 +152,7 @@ object TesseractEngine {
      */
     fun getOcrLanguage(context: Context): String {
         val prefs = context.getSharedPreferences("OcrSettings", Context.MODE_PRIVATE)
-        var savedLang = prefs.getString("selected_lang", "")
-
-        // Auto-upgrade legacy single language choice to dual language
-        if (savedLang == "rus") {
-            savedLang = "rus+eng"
-            prefs.edit().putString("selected_lang", savedLang).apply()
-        }
-
-        // Use system language if no user selection
-        if (savedLang.isNullOrEmpty()) {
-            val systemLang = getSystemLanguage()
-            // Save system language as default
-            prefs.edit().putString("selected_lang", systemLang).apply()
-            return systemLang
-        }
-
-        return savedLang
+        return prefs.getString("selected_lang", "rus+eng") ?: "rus+eng"
     }
 
     /**
@@ -211,64 +218,83 @@ object TesseractEngine {
     }
 
     /**
-     * Tiled extraction: Runs multiple OCR passes in parallel and merges results.
-     * This mirrors the QR scanner's multi-resolution logic to maximize accuracy.
+     * Extracts text from a bitmap using a cached Tesseract instance for massive speed improvements.
      */
-    suspend fun extractText(context: Context, bitmap: Bitmap): List<TextNode> = coroutineScope {
-        val dataPath = withContext(Dispatchers.IO) { prepareTessData(context) }
+    suspend fun extractText(context: Context, bitmap: Bitmap): List<TextNode> = withContext(Dispatchers.IO) {
+        val dataPath = prepareTessData(context)
         // Use automatic language detection
         val lang = getOcrLanguage(context)
 
-        val w = bitmap.width
-        val h = bitmap.height
-
-        // Define Tiles (Full + 2x2 Grid with 20% overlap)
-        val tiles = mutableListOf<Rect>()
-        // 1. Full
-        tiles.add(Rect(0, 0, w, h))
-        
-        // 2. 2x2 Grid (Each tile is ~60% size to provide nice overlap)
-        val tw = (w * 0.6f).toInt()
-        val th = (h * 0.6f).toInt()
-        tiles.add(Rect(0, 0, tw, th)) // Top Left
-        tiles.add(Rect(w - tw, 0, w, th)) // Top Right
-        tiles.add(Rect(0, h - th, tw, h)) // Bottom Left
-        tiles.add(Rect(w - tw, h - th, w, h)) // Bottom Right
-
-        val allPasses = tiles.mapIndexed { index, rect ->
-            async(Dispatchers.Default) {
-                index to internalExtractWords(dataPath, lang, bitmap, rect)
+        val words = ocrMutex.withLock {
+            if (cachedTessApi == null || cachedLang != lang) {
+                cachedTessApi?.recycle()
+                cachedTessApi = TessBaseAPI()
+                val success = cachedTessApi?.init(dataPath, lang) ?: false
+                if (!success) {
+                    cachedTessApi?.recycle()
+                    cachedTessApi = null
+                    return@withLock emptyList<Word>()
+                }
+                cachedLang = lang
             }
-        }
 
-        val allWordsWithSource = allPasses.awaitAll().flatMap { (index, words) ->
-            words.map { index to it }
-        }
-        
-        // Final Merge & Line Grouping
-        groupWordsIntoNodes(allWordsWithSource)
-    }
-
-    private fun internalExtractWords(dataPath: String, lang: String, fullBitmap: Bitmap, crop: Rect): List<Word> {
-        val words = mutableListOf<Word>()
-        val tess = TessBaseAPI()
-        try {
-            if (!tess.init(dataPath, lang)) return emptyList()
+            // SPEED AND QUALITY OPTIMIZATION:
+            // Scaling + Conversion to B&W with high contrast.
+            val maxDim = Math.max(bitmap.width, bitmap.height).toFloat()
+            val targetMax = 2048f
+            // UI text can be small. Scale by 1.5x up to a hard cap of ~2048px.
+            val scaleFactor = Math.min(1.5f, targetMax / maxDim).coerceAtLeast(1f)
             
-            // If the crop is a sub-region, create a subset bitmap
-            val tileBitmap = if (crop.left == 0 && crop.top == 0 && crop.width() == fullBitmap.width && crop.height() == fullBitmap.height) {
-                fullBitmap
-            } else {
-                Bitmap.createBitmap(fullBitmap, crop.left, crop.top, crop.width(), crop.height())
+            val scaledWidth = (bitmap.width * scaleFactor).toInt()
+            val scaledHeight = (bitmap.height * scaleFactor).toInt()
+            
+            val processedBitmap = Bitmap.createBitmap(scaledWidth, scaledHeight, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(processedBitmap)
+            val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG) // Bilinear filtering
+            
+            // Smart Binarization & Inversion
+            val avgLuminance = calculateAverageLuminance(bitmap)
+            val isDarkMode = avgLuminance < 128f
+
+            val colorMatrix = android.graphics.ColorMatrix()
+            colorMatrix.setSaturation(0f) // Grayscale
+            
+            if (isDarkMode) {
+                // Invert the image (makes text black and backgrounds white)
+                colorMatrix.postConcat(android.graphics.ColorMatrix(floatArrayOf(
+                    -1f, 0f, 0f, 0f, 255f,
+                    0f, -1f, 0f, 0f, 255f,
+                    0f, 0f, -1f, 0f, 255f,
+                    0f, 0f, 0f, 1f, 0f
+                )))
             }
 
-            tess.setImage(tileBitmap)
-            tess.getUTF8Text() // Trigger recognition
+            // Harsh contrast multiplier to force binarization and crush background noise
+            val contrast = 5.0f
+            val translate = (-128f * contrast) + 128f
+            colorMatrix.postConcat(android.graphics.ColorMatrix(floatArrayOf(
+                contrast, 0f, 0f, 0f, translate,
+                0f, contrast, 0f, 0f, translate,
+                0f, 0f, contrast, 0f, translate,
+                0f, 0f, 0f, 1f, 0f
+            )))
+            
+            paint.colorFilter = android.graphics.ColorMatrixColorFilter(colorMatrix)
+            
+            val matrix = android.graphics.Matrix()
+            matrix.postScale(scaleFactor, scaleFactor)
+            canvas.drawBitmap(bitmap, matrix, paint)
 
-            val iterator = tess.resultIterator ?: run {
-                tess.recycle()
-                return emptyList()
-            }
+            val api = cachedTessApi!!
+            
+            // Set Page Segmentation Mode to Sparse Text (11) to handle non-linear chat bubbles
+            api.pageSegMode = TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT
+            
+            api.setImage(processedBitmap)
+            api.getUTF8Text() // Trigger recognition
+
+            val iterator = api.resultIterator ?: return@withLock emptyList<Word>()
+            val extractedWords = mutableListOf<Word>()
 
             iterator.begin()
             do {
@@ -288,33 +314,34 @@ object TesseractEngine {
 
                 if (wRect.isEmpty || wRect.width() < 2) continue
 
-                // Adjust coordinates to global screen space
-                val globalBounds = RectF(
-                    (wRect.left + crop.left).toFloat(),
-                    (wRect.top + crop.top).toFloat(),
-                    (wRect.right + crop.left).toFloat(),
-                    (wRect.bottom + crop.top).toFloat()
-                )
-
-                words.add(
+                extractedWords.add(
                     Word(
                         text = wordText,
-                        index = 0, // Assigned later
+                        index = 0,
                         startIndex = 0,
                         endIndex = wordText.length,
-                        bounds = globalBounds
+                        // Return coordinates back to the original screen scale
+                        bounds = RectF(
+                            wRect.left / scaleFactor,
+                            wRect.top / scaleFactor,
+                            wRect.right / scaleFactor,
+                            wRect.bottom / scaleFactor
+                        )
                     )
                 )
-
             } while (iterator.next(TessBaseAPI.PageIteratorLevel.RIL_WORD))
 
             iterator.delete()
-        } catch (e: Exception) {
-            Log.e(TAG, "Tile process error: ${e.message}")
-        } finally {
-            tess.recycle()
+            api.clear() // Clear image buffer from native memory to prevent leaks, but keep models loaded
+            processedBitmap.recycle()
+            extractedWords
         }
-        return words
+
+        // Wrapper to maintain compatibility with groupWordsIntoNodes
+        val allWordsWithSource = words.map { 0 to it }
+        
+        // Final Merge & Line Grouping
+        groupWordsIntoNodes(allWordsWithSource)
     }
 
     private fun groupWordsIntoNodes(allWordsWithSource: List<Pair<Int, Word>>): List<TextNode> {
@@ -324,7 +351,7 @@ object TesseractEngine {
         // We prefer results from quadrants (indices 1-4) over the full pass (index 0) 
         // because zoomed-in crops generally yield higher accuracy for small text.
         val uniqueWords = mutableListOf<Word>()
-        val sortedByPreference = allWordsWithSource.sortedWith(compareByDescending<Pair<Int, Word>> { it.first }.thenByDescending { it.second.bounds.width() * it.second.bounds.height() })
+        val sortedByPreference = allWordsWithSource.sortedWith(compareByDescending<Pair<Int, Word>> { it.first }.thenBy { it.second.bounds.width() * it.second.bounds.height() })
         
         for (pair in sortedByPreference) {
             val w = pair.second
@@ -333,40 +360,45 @@ object TesseractEngine {
                 if (overlap.intersect(existing.bounds)) {
                     val overlapArea = overlap.width() * overlap.height()
                     val wArea = w.bounds.width() * w.bounds.height()
-                    val textMatch = w.text.equals(existing.text, ignoreCase = true)
-                    // If text matches and there is significant overlap, it's a duplicate
-                    overlapArea > wArea * 0.7 && textMatch
+                    val existingArea = existing.bounds.width() * existing.bounds.height()
+                    // If overlap area is more than 50% of the SMALLEST word, it's a duplicate.
+                    overlapArea > minOf(wArea, existingArea) * 0.5f
                 } else false
             }
             if (!isDuplicate) uniqueWords.add(w)
         }
 
-        // 2. Line Clustering (Vertical Overlap)
+        // 2. Line Clustering (Vertical Overlap & Horizontal Proximity)
         val sortedWords = uniqueWords.sortedBy { it.bounds.top }
         val lines = mutableListOf<MutableList<Word>>()
         
-        if (sortedWords.isNotEmpty()) {
-            var currentLine = mutableListOf<Word>()
-            currentLine.add(sortedWords[0])
-            lines.add(currentLine)
+        for (word in sortedWords) {
+            var addedToLine = false
             
-            for (i in 1 until sortedWords.size) {
-                val prev = currentLine.last()
-                val curr = sortedWords[i]
+            for (line in lines) {
+                val referenceWord = line.first()
+                val avgHeight = (referenceWord.bounds.height() + word.bounds.height()) / 2f
+                val verticalOverlap = Math.abs(word.bounds.centerY() - referenceWord.bounds.centerY()) < (avgHeight * 0.6f)
                 
-                val avgHeight = (curr.bounds.height() + prev.bounds.height()) / 2f
-                val verticalOverlap = Math.abs(curr.bounds.centerY() - prev.bounds.centerY()) < (avgHeight * 0.6f)
-                
-                // Prevent multi-column bleeding: Max horizontal gap of ~3.5 character widths
-                val horizontalGap = curr.bounds.left - prev.bounds.right
-                val isCloseHorizontally = horizontalGap < (avgHeight * 3.5f)
-                
-                if (verticalOverlap && isCloseHorizontally) {
-                    currentLine.add(curr)
-                } else {
-                    currentLine = mutableListOf(curr)
-                    lines.add(currentLine)
+                if (verticalOverlap) {
+                    // If words are at the same level, check that they are close horizontally
+                    val maxGap = avgHeight * 3.5f
+                    val isCloseHorizontally = line.any { w ->
+                        val gap1 = word.bounds.left - w.bounds.right
+                        val gap2 = w.bounds.left - word.bounds.right
+                        maxOf(gap1, gap2) < maxGap
+                    }
+                    
+                    if (isCloseHorizontally) {
+                        line.add(word)
+                        addedToLine = true
+                        break
+                    }
                 }
+            }
+            
+            if (!addedToLine) {
+                lines.add(mutableListOf(word))
             }
         }
 
@@ -375,31 +407,20 @@ object TesseractEngine {
         lines.forEach { lineWords ->
             val finalLineWords = lineWords.sortedBy { it.bounds.left }
             
-            val rawLineText = finalLineWords.joinToString(" ") { it.text }
-            val cCyr = rawLineText.count { it in 'А'..'я' || it == 'Ё' || it == 'ё' }
-            val cLat = rawLineText.count { it in 'A'..'Z' || it in 'a'..'z' }
+            val lineText = finalLineWords.joinToString(" ") { it.text }
+            val cCyr = lineText.count { it in 'А'..'я' || it == 'Ё' || it == 'ё' }
+            val cLat = lineText.count { it in 'A'..'Z' || it in 'a'..'z' }
             val lineDominantCyrillic = cCyr >= cLat
             
-            // Проверяем, не написана ли вся строка капсом (чтобы не понижать регистр легальным аббревиатурам)
-            val lettersOnly = rawLineText.filter { it.isLetter() }
-            val lineIsAllCaps = lettersOnly.isNotEmpty() && lettersOnly.all { it.isUpperCase() }
-
             val cleanedWords = mutableListOf<Word>()
             val lineBounds = Rect()
-                
-            finalLineWords.forEach { w ->
-                var cleanedText = cleanWordText(w.text, lineDominantCyrillic)
-                
-                // Фикс бага OCR с КАПСОМ: если слово длиннее 2 букв и всё из заглавных, но
-                // всё остальное предложение нормальное — Tesseract ошибся. Понижаем регистр.
-                if (!lineIsAllCaps && cleanedText.length > 2 && cleanedText.all { !it.isLetter() || it.isUpperCase() }) {
-                    cleanedText = cleanedText.lowercase()
-                }
-
+            
+            finalLineWords.forEachIndexed { idx, w ->
+                val cleanedText = cleanWordText(w.text, lineDominantCyrillic)
                 if (cleanedText.isNotBlank()) {
                     val r = Rect()
                     w.bounds.roundOut(r)
-                    if (lineBounds.isEmpty()) lineBounds.set(r) else lineBounds.union(r)
+                    if (lineBounds.isEmpty) lineBounds.set(r) else lineBounds.union(r)
                     
                     cleanedWords.add(w.copy(index = cleanedWords.size, text = cleanedText))
                 }

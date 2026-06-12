@@ -66,7 +66,7 @@ class CopyTextOverlayManager(
      * Starts text analysis. Called automatically on startup.
      */
     fun startAnalysis() {
-        dimView?.let { scanNodes(it) }
+        // No-op: getOverlayView already calls scanNodes natively. Prevents double-scanning.
     }
 
     /**
@@ -212,7 +212,7 @@ class CopyTextOverlayManager(
                 
                 onAnalysisCompleteCallback?.invoke(textNodes.size)
                 Log.d("CopyTextOverlay", "Analysis complete: ${textNodes.size} total nodes")
-            } catch (e: Exception) {
+            } catch (e: Throwable) { // Catch Throwable to prevent silent OutOfMemoryErrors from locking UI
                 Log.e("CopyTextOverlay", "Extraction failed: ${e.message}")
             } finally {
                 isScanning.value = false

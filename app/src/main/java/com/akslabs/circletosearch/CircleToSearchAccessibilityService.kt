@@ -744,7 +744,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                         val translatedBitmap = ScreenTranslator().use { translator ->
                                             translator.translateScreen(copy)
                                         }
-                                        // translateScreen создаёт свою копию — оригинальный copy можно освободить сразу
+                                        // translateScreen creates its own copy — original copy can be released immediately
                                         copy.recycle()
                                         withContext(Dispatchers.Main) {
                                             BitmapRepository.setScreenshot(translatedBitmap)
@@ -753,7 +753,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                         }
                                     } catch (e: Exception) {
                                         android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
-                                        // Перевод не удался — используем оригинальный copy
+                                        // Translation failed — use original copy
                                         withContext(Dispatchers.Main) {
                                             BitmapRepository.setScreenshot(copy)
                                             launchOverlay(searchModeOverride)

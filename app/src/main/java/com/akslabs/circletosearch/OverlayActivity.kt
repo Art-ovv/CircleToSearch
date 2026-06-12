@@ -151,9 +151,6 @@ class OverlayActivity : ComponentActivity() {
             screenshotBitmap = screenshotBitmap.value
         )
         CircleToSearchAccessibilityService.setCopyTextManager(copyTextManager.value)
-
-        // Automatically trigger analysis for new screenshot
-        copyTextManager.value?.startAnalysis()
     }
 
     private fun updateOverride(intent: android.content.Intent) {
@@ -206,9 +203,6 @@ class OverlayActivity : ComponentActivity() {
         if (bitmap != null) {
             android.util.Log.d("CircleToSearch", "Bitmap loaded from Repository. Size: ${bitmap.width}x${bitmap.height}")
             screenshotBitmap.value = bitmap
-
-            // Automatically trigger text analysis after screenshot load
-            copyTextManager.value?.startAnalysis()
         } else {
             android.util.Log.e("CircleToSearch", "No bitmap in Repository")
         }
@@ -223,7 +217,6 @@ class OverlayActivity : ComponentActivity() {
         screenshotBitmap.value = null
 
         if (isFinishing) {
-             com.akslabs.circletosearch.data.BitmapRepository.clear()
              com.akslabs.circletosearch.data.AssistDataRepository.clear()
              com.akslabs.circletosearch.utils.StorageUtils.clearAppCache(this)
         }

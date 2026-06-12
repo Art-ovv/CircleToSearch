@@ -157,7 +157,7 @@ class ScreenTranslator : Closeable {
     private fun getDominantEdgeColor(bitmap: Bitmap, bounds: Rect): Int {
         val colorCounts = mutableMapOf<Int, Int>()
 
-        // ОПТИМИЗАЦИЯ: Расширяем рамку наружу (padding), чтобы сойти со шрифта на чистый фон.
+        // OPTIMIZATION: Expand the box outward (padding) to move from the font to the clean background.
         val padding = 4
         val left = (bounds.left - padding).coerceIn(0, bitmap.width - 1)
         val right = (bounds.right + padding).coerceIn(0, bitmap.width - 1)
