@@ -131,4 +131,10 @@ dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
     implementation("com.github.adaptech-cz.Tesseract4Android:tesseract4android:4.7.0")
     implementation("com.google.zxing:core:3.5.4")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:language-id:17.0.5")
+    implementation("com.google.mlkit:translate:17.0.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
+
+
 }
