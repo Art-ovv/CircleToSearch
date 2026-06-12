@@ -64,6 +64,12 @@ import com.akslabs.circletosearch.ui.components.CopyTextOverlayManager
 import com.akslabs.circletosearch.utils.ImageUtils
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.SupervisorJob
+import java.util.concurrent.atomic.AtomicBoolean
 
 class CircleToSearchAccessibilityService : AccessibilityService() {
 
@@ -71,6 +77,11 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private val overlayViews = mutableListOf<View>() // Track all added segment views
     private val executor: Executor = Executors.newSingleThreadExecutor()
     private lateinit var configManager: OverlayConfigurationManager
+    
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
+
+    private val isTranslatingFlag = AtomicBoolean(false)
     
     /** Kept by companion so scroll events can re-scan copy-text nodes. */
     internal var copyTextManager: CopyTextOverlayManager? = null
@@ -104,7 +115,6 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         val info = serviceInfo
         info.flags = info.flags or 
             android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-            android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY or
             android.accessibilityservice.AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
         serviceInfo = info
         
@@ -478,7 +488,13 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         if (action == ActionType.NONE) return
         
         // Haptic feedback for action trigger
-        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
         } else {
@@ -684,12 +700,17 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun performCapture(searchModeOverride: Boolean? = null) {
+    private fun performCapture(searchModeOverride: Boolean? = null, translateScreen: Boolean = false) {
         android.util.Log.d("CircleToSearch", "performCapture called. hasWindowManager=${windowManager != null}")
-        
+
         // Clear repository at the source to prevent any "ghost" flash of old data
         BitmapRepository.clear()
-        
+
+        if (translateScreen && !isTranslatingFlag.compareAndSet(false, true)) {
+            android.util.Log.d("CircleToSearch", "Translation already in progress, skipping")
+            return
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             takeScreenshot(
                 Display.DEFAULT_DISPLAY,
@@ -699,34 +720,64 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                          try {
                             val hardwareBuffer = screenshot.hardwareBuffer
                             val colorSpace = screenshot.colorSpace
-                            
+
                             val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
+                            hardwareBuffer.close() // Close buffer after getting bitmap
+
                             if (bitmap == null) {
-                                hardwareBuffer.close()
+                                isTranslatingFlag.set(false)
                                 return
                             }
 
                             // Copy to software bitmap
                             val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                            hardwareBuffer.close() // Close buffer after copy
+                            bitmap.recycle() // Release original bitmap
 
                             if (copy == null) {
+                                isTranslatingFlag.set(false)
                                 return
                             }
-                            
-                            // Store in Repository (In-Memory)
-                            BitmapRepository.setScreenshot(copy)
-                            
-                            // Launch Overlay Immediately
-                            launchOverlay(searchModeOverride)
-                            
+
+                            if (translateScreen) {
+                                serviceScope.launch {
+                                    try {
+                                        val translatedBitmap = ScreenTranslator().use { translator ->
+                                            translator.translateScreen(copy)
+                                        }
+                                        // translateScreen создаёт свою копию — оригинальный copy можно освободить сразу
+                                        copy.recycle()
+                                        withContext(Dispatchers.Main) {
+                                            BitmapRepository.setScreenshot(translatedBitmap)
+                                            launchOverlay(searchModeOverride)
+                                            isTranslatingFlag.set(false)
+                                        }
+                                    } catch (e: Exception) {
+                                        android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
+                                        // Перевод не удался — используем оригинальный copy
+                                        withContext(Dispatchers.Main) {
+                                            BitmapRepository.setScreenshot(copy)
+                                            launchOverlay(searchModeOverride)
+                                            isTranslatingFlag.set(false)
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Store in Repository (In-Memory)
+                                BitmapRepository.setScreenshot(copy)
+
+                                // Launch Overlay Immediately
+                                launchOverlay(searchModeOverride)
+                            }
+
                         } catch (e: Exception) {
                             e.printStackTrace()
+                            isTranslatingFlag.set(false)
                         }
                     }
 
                     override fun onFailure(errorCode: Int) {
                         android.util.Log.e("CircleToSearch", "Screenshot failed with error code: $errorCode")
+                        isTranslatingFlag.set(false)
                     }
                 }
             )
@@ -750,27 +801,49 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         private val rect = RectF()
         private val matrix = Matrix()
         private val radius = 12f * context.resources.displayMetrics.density
+        private var cachedBitmap: Bitmap? = null
+        private var cachedShader: BitmapShader? = null
+
+        override fun setImageBitmap(bm: Bitmap?) {
+            cachedBitmap?.recycle()
+            cachedBitmap = null
+            cachedShader = null
+            super.setImageBitmap(bm)
+        }
 
         override fun onDraw(canvas: android.graphics.Canvas) {
             val drawable = drawable ?: return
-            val bitmap = try { 
-                drawable.toBitmap() 
-            } catch (e: Exception) { 
-                return 
+
+            if (cachedBitmap == null || cachedShader == null) {
+                cachedBitmap?.recycle()
+                cachedBitmap = try {
+                    drawable.toBitmap()
+                } catch (e: Exception) {
+                    return
+                }
+
+                val shader = BitmapShader(cachedBitmap!!, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                cachedShader = shader
             }
-            
-            val shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-            
+
+            val bitmap = cachedBitmap!!
+
             // Adjust shader to current view bounds
             matrix.reset()
             matrix.setScale(width.toFloat() / bitmap.width, height.toFloat() / bitmap.height)
-            shader.setLocalMatrix(matrix)
-            
-            paint.shader = shader
+            cachedShader!!.setLocalMatrix(matrix)
+
+            paint.shader = cachedShader
             rect.set(0f, 0f, width.toFloat(), height.toFloat())
-            
+
             // This never "looses roundness" because it's rendering at the pixel level on each frame
             canvas.drawRoundRect(rect, radius, radius, paint)
+        }
+
+        fun releaseResources() {
+            cachedBitmap?.recycle()
+            cachedBitmap = null
+            cachedShader = null
         }
     }
 
@@ -1176,6 +1249,11 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             android.util.Log.d("CircleToSearch", "triggerCapture static called. instance=${instance != null}")
             instance?.performCapture(null)
         }
+        
+        fun triggerTranslateCapture() {
+            android.util.Log.d("CircleToSearch", "triggerTranslateCapture static called. instance=${instance != null}")
+            instance?.performCapture(null, translateScreen = true)
+        }
 
         fun pinArea(bitmap: Bitmap, rect: android.graphics.Rect) {
             android.util.Log.d("CircleToSearch", "pinArea static called. instance=${instance != null}")
@@ -1195,6 +1273,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         instance = null
         prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
         overlayPrefs.unregisterOnSharedPreferenceChangeListener(overlayPrefsListener)
+        serviceJob.cancel()
         
         overlayViews.forEach { view ->
              try {
@@ -1206,4 +1285,3 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         hideBubble()
     }
 }
-

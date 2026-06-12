@@ -35,6 +35,7 @@ class UIPreferences(context: Context) {
         private const val KEY_SHOW_FRIENDLY_MESSAGES = "show_friendly_messages"
         private const val KEY_SEARCH_ENGINE_ORDER = "search_engine_order"
         private const val KEY_USE_GOOGLE_LENS_ONLY = "use_google_lens_only"
+        private const val KEY_TARGET_TRANSLATE_LANG = "target_translate_lang"
     }
 
     fun observeUseGoogleLensOnly(): Flow<Boolean> = callbackFlow {
@@ -97,5 +98,13 @@ class UIPreferences(context: Context) {
 
     fun setSearchEngineOrder(order: String) {
         prefs.edit().putString(KEY_SEARCH_ENGINE_ORDER, order).apply()
+    }
+
+    fun getTargetTranslateLang(): String? {
+        return prefs.getString(KEY_TARGET_TRANSLATE_LANG, null)
+    }
+
+    fun setTargetTranslateLang(langCode: String?) {
+        prefs.edit().putString(KEY_TARGET_TRANSLATE_LANG, langCode).apply()
     }
 }
