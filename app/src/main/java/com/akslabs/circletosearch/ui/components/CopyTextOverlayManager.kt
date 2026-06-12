@@ -31,11 +31,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Alignment
 import com.akslabs.circletosearch.data.BitmapRepository
-import com.akslabs.circletosearch.ocr.TesseractEngine
 import com.akslabs.circletosearch.utils.ImageUtils
 import kotlinx.coroutines.*
-import java.util.UUID
-
 /** Simple holder for a floating-toolbar button's label and screen hit-rect. */
 private class ToolbarButton(val label: String, val rect: Rect)
 
@@ -50,43 +47,40 @@ class CopyTextOverlayManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var scanJob: Job? = null
     private var onDismissCallback: (() -> Unit)? = null
+    private var onAnalysisCompleteCallback: ((Int) -> Unit)? = null
 
-    // State for Compose and Drawing
     private val isScanning = mutableStateOf(false)
-    private val textNodes = mutableStateListOf<TextNode>()
-    private var allWords: List<Word> = emptyList()
-    
-    // Status message for the user
     private val statusMessage = mutableStateOf<String?>(null)
-    
-    // Assistant Data support
-    var isAssistMode: Boolean = false
-        private set
-    
-    private var nativeNodes: List<TextNode> = emptyList()
+    private val textNodes = mutableListOf<TextNode>()
+    private var allWords: List<Word> = emptyList()
 
-    fun setHybridMode(nodes: List<TextNode>) {
-        isAssistMode = true
-        nativeNodes = nodes
-        textNodes.clear()
-        textNodes.addAll(nodes)
-        updateAllWords()
+    /**
+     * Sets a callback that is invoked after the analysis is complete.
+     * @param callback receives the number of text nodes found.
+     */
+    fun setOnAnalysisComplete(callback: (Int) -> Unit) {
+        onAnalysisCompleteCallback = callback
     }
-    
-    fun setOcrOnlyMode() {
-        isAssistMode = false
-        nativeNodes = emptyList()
-        textNodes.clear()
-        allWords = emptyList()
-        statusMessage.value = null
+
+    /**
+     * Starts text analysis. Called automatically on startup.
+     */
+    fun startAnalysis() {
+        dimView?.let { scanNodes(it) }
     }
-    
+
+    /**
+     * Returns the number of found text nodes.
+     */
+    fun getNodeCount(): Int = textNodes.size
+
+    /**
+     * Checks if scanning is currently in progress.
+     */
+    fun isScanning(): Boolean = isScanning.value
+
     private fun updateAllWords() {
-        allWords = textNodes.flatMap { node -> 
-            node.words.map { word -> 
-                word
-            }
-        }
+        allWords = textNodes.flatMap { it.words }
     }
     
     // Selection state
@@ -124,7 +118,7 @@ class CopyTextOverlayManager(
                                 )
                                 Spacer(Modifier.height(16.dp))
                                 Text(
-                                    if (isAssistMode) "Hybrid Deep Scan..." else "Scanning text...", 
+                                    "Scanning text...", 
                                     style = MaterialTheme.typography.titleMedium,
                                     color = ComposeColor.White,
                                     modifier = Modifier
@@ -155,26 +149,13 @@ class CopyTextOverlayManager(
         }
         container.addView(topBar)
 
-        if (isAssistMode) {
-            // Trigger parallel OCR scan even if we have native nodes
-            scanNodes(view, isHybrid = true)
-        } else {
-            scanNodes(view, isHybrid = false)
-        }
+        scanNodes(view)
+        
         return container
     }
 
     @Composable
     private fun TopBarUI(onClose: () -> Unit) {
-        val filePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-            contract = androidx.activity.result.contract.ActivityResultContracts.GetContent()
-        ) { uri: android.net.Uri? ->
-            if (uri != null) {
-                TesseractEngine.importModel(context, uri) { success, msg ->
-                    android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
 
         Row(
             modifier = Modifier
@@ -192,64 +173,10 @@ class CopyTextOverlayManager(
             ) {
                 Icon(Icons.Default.Close, contentDescription = "Exit Copy Mode", tint = ComposeColor.White)
             }
-            
-            Spacer(modifier = Modifier.weight(1f))
-
-            Box {
-                var showMenu by remember { mutableStateOf(false) }
-                IconButton(
-                    onClick = { showMenu = true },
-                    modifier = Modifier
-                        .background(ComposeColor.Black.copy(alpha = 0.35f), CircleShape)
-                        .size(40.dp)
-                ) {
-                    Icon(Icons.Default.MoreVert, contentDescription = "Menu", tint = ComposeColor.White)
-                }
-
-                DropdownMenu(
-                    expanded = showMenu,
-                    onDismissRequest = { showMenu = false },
-                    shape = RoundedCornerShape(28.dp),
-                    tonalElevation = 6.dp
-                ) {
-                    DropdownMenuItem(
-                        text = { Text("Select Language / Model") },
-                        onClick = {
-                            showMenu = false
-                            showLanguageModelSelector()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Import Model (.traineddata)") },
-                        onClick = {
-                            showMenu = false
-                            filePickerLauncher.launch("*/*")
-                        }
-                    )
-                }
-            }
         }
     }
 
     private fun Int.toComposeColor(): ComposeColor = ComposeColor(this)
-
-    private fun showLanguageModelSelector() {
-        val models = TesseractEngine.getAvailableModels(context)
-        val prefs = context.getSharedPreferences("OcrSettings", Context.MODE_PRIVATE)
-        val current = prefs.getString("selected_lang", "eng") ?: "eng"
-        
-        android.app.AlertDialog.Builder(context)
-            .setTitle("Select OCR Model")
-            .setSingleChoiceItems(models.toTypedArray(), models.indexOf(current)) { dialog, which ->
-                val selected = models[which]
-                prefs.edit().putString("selected_lang", selected).apply()
-                Toast.makeText(context, "Selected: ${selected.uppercase()}. Restarting scan...", Toast.LENGTH_SHORT).show()
-                dialog.dismiss()
-                rescanNodes()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
 
     fun dismiss() {
         scanJob?.cancel()
@@ -262,40 +189,29 @@ class CopyTextOverlayManager(
         dimView?.let { scanNodes(it) }
     }
 
-    private fun scanNodes(view: View, isHybrid: Boolean = false) {
+    private fun scanNodes(view: View) {
         scanJob?.cancel()
-        statusMessage.value = null
         scanJob = scope.launch(Dispatchers.Main) {
             isScanning.value = true
             val bitmap = screenshotBitmap ?: BitmapRepository.getScreenshot()
-            
+
             if (bitmap == null) {
-                if (isAssistMode && textNodes.isEmpty()) {
-                    statusMessage.value = "This app doesn't allow reading screen content."
-                }
                 isScanning.value = false
                 view.invalidate()
                 return@launch
             }
 
             try {
-                // OCR scan runs on background thread
-                val ocrNodes = TesseractEngine.extractText(context, bitmap)
-                
-                if (isHybrid) {
-                    mergeHybridNodes(ocrNodes)
-                } else {
-                    val sortedNodes = ocrNodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
-                    textNodes.clear()
-                    textNodes.addAll(sortedNodes)
-                    updateAllWords()
+                val ocrNodes = withContext(Dispatchers.IO) {
+                    com.akslabs.circletosearch.ocr.TesseractEngine.extractText(context, bitmap)
                 }
+                val sortedNodes = ocrNodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
+                textNodes.clear()
+                textNodes.addAll(sortedNodes)
+                updateAllWords()
                 
-                if (textNodes.isEmpty()) {
-                    statusMessage.value = "No text found on screen."
-                }
-                
-                Log.d("CopyTextOverlay", "Capture complete: ${textNodes.size} total nodes")
+                onAnalysisCompleteCallback?.invoke(textNodes.size)
+                Log.d("CopyTextOverlay", "Analysis complete: ${textNodes.size} total nodes")
             } catch (e: Exception) {
                 Log.e("CopyTextOverlay", "Extraction failed: ${e.message}")
             } finally {
@@ -305,56 +221,15 @@ class CopyTextOverlayManager(
         }
     }
 
-    private fun mergeHybridNodes(ocrNodes: List<TextNode>) {
-        val newNodes = mutableListOf<TextNode>()
-        // Start with existing native nodes
-        newNodes.addAll(nativeNodes)
-        
-        for (ocr in ocrNodes) {
-            if (!isDuplicate(ocr, nativeNodes)) {
-                // Only add if OCR node is within screen bounds (roughly)
-                if (ocr.bounds.left >= -50 && ocr.bounds.top >= -50) {
-                    newNodes.add(ocr)
-                }
-            }
-        }
-        
-        val sortedNodes = newNodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
-        textNodes.clear()
-        textNodes.addAll(sortedNodes)
-        updateAllWords()
-    }
-
-    private fun isDuplicate(ocr: TextNode, natives: List<TextNode>): Boolean {
-        for (native in natives) {
-            // 1. Coordinate Overlap Check (> 50% overlap)
-            val ocrRect = ocr.bounds
-            val nativeRect = native.bounds
-            
-            val intersect = Rect(ocrRect)
-            if (intersect.intersect(nativeRect)) {
-                val intersectArea = intersect.width() * intersect.height()
-                val ocrArea = ocrRect.width() * ocrRect.height()
-                if (intersectArea > ocrArea * 0.5) return true
-            }
-            
-            // 2. Text Similarity Check
-            val ocrT = ocr.fullText.lowercase().trim()
-            val nativeT = native.fullText.lowercase().trim()
-            if (nativeT.contains(ocrT) || ocrT.contains(nativeT)) return true
-        }
-        return false
-    }
-
     @SuppressLint("ClickableViewAccessibility")
     inner class DimPunchOutView(context: Context) : View(context) {
         private val density = resources.displayMetrics.density
-        private val viewLocation = IntArray(2)
 
         private val dimPaint = Paint().apply { color = Color.BLACK; alpha = 38; isAntiAlias = false }
         private val selectedWordPaint = Paint().apply {
             color = try { context.getColor(android.R.color.system_accent1_200) } catch(e: Exception) { Color.parseColor("#D0BCFF") }
-            alpha = 150; isAntiAlias = true
+            alpha = 90
+            isAntiAlias = true
         }
         private val handlePaint = Paint().apply { color = Color.parseColor("#6750A4"); isAntiAlias = true }
         private val toolbarBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#F3EDF7") }
@@ -379,37 +254,26 @@ class CopyTextOverlayManager(
             setLayerType(LAYER_TYPE_SOFTWARE, null)
         }
 
-        private fun toLocal(screenRect: Rect): RectF {
-            getLocationOnScreen(viewLocation)
-            return RectF(
-                (screenRect.left - viewLocation[0]).toFloat(),
-                (screenRect.top - viewLocation[1]).toFloat(),
-                (screenRect.right - viewLocation[0]).toFloat(),
-                (screenRect.bottom - viewLocation[1]).toFloat()
-            )
+        private fun scaleRect(r: RectF): RectF {
+            val sx = width.toFloat() / (screenshotBitmap?.width?.toFloat() ?: 1f)
+            val sy = height.toFloat() / (screenshotBitmap?.height?.toFloat() ?: 1f)
+            return RectF(r.left * sx, r.top * sy, r.right * sx, r.bottom * sy)
         }
-
-        private fun toLocal(screenRectF: RectF): RectF {
-            getLocationOnScreen(viewLocation)
-            return RectF(
-                screenRectF.left - viewLocation[0],
-                screenRectF.top - viewLocation[1],
-                screenRectF.right - viewLocation[0],
-                screenRectF.bottom - viewLocation[1]
-            )
-        }
-
-        private fun toScreenX(localX: Float): Float { getLocationOnScreen(viewLocation); return localX + viewLocation[0] }
-        private fun toScreenY(localY: Float): Float { getLocationOnScreen(viewLocation); return localY + viewLocation[1] }
+        
+        private fun scaleRect(r: Rect): RectF = scaleRect(RectF(r))
 
         override fun onDraw(canvas: Canvas) {
+            if (globalSelectionStart == -1 || globalSelectionEnd == -1) {
+                return // Do not dim or show text blocks if nothing is selected
+            }
+
             val saveCount = canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), null)
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), dimPaint)
 
             textNodes.forEach { node ->
-                val localBounds = toLocal(node.bounds)
-                localBounds.inset(-12f, -8f)
-                canvas.drawRoundRect(localBounds, 12f, 12f, clearPaint)
+                val scaledBounds = scaleRect(node.bounds)
+                scaledBounds.inset(-8f, -4f)
+                canvas.drawRoundRect(scaledBounds, 8f, 8f, clearPaint)
             }
 
             if (globalSelectionStart != -1 && globalSelectionEnd != -1) {
@@ -423,20 +287,20 @@ class CopyTextOverlayManager(
                     val first = wordsInLine.minBy { it.bounds.left }
                     val last = wordsInLine.maxBy { it.bounds.right }
                     val lineRect = RectF(first.bounds.left, wordsInLine.minOf { it.bounds.top }, last.bounds.right, wordsInLine.maxOf { it.bounds.bottom })
-                    val localHighlight = toLocal(lineRect)
-                    localHighlight.inset(-12f, -8f)
-                    highlightPath.addRoundRect(localHighlight, 8f, 8f, Path.Direction.CW)
+                    val scaledHighlight = scaleRect(lineRect)
+                    scaledHighlight.inset(-8f, -4f)
+                    highlightPath.addRoundRect(scaledHighlight, 8f, 8f, Path.Direction.CW)
                 }
                 canvas.drawPath(highlightPath, selectedWordPaint)
 
-                val startLocal = toLocal(allWords[start].bounds)
-                val endLocal = toLocal(allWords[end].bounds)
+                val startLocal = scaleRect(allWords[start].bounds)
+                val endLocal = scaleRect(allWords[end].bounds)
                 drawHandle(canvas, startLocal.left, startLocal.top, true)
                 drawHandle(canvas, endLocal.right, endLocal.bottom, false)
 
                 val encompassing = RectF(allWords[start].bounds)
                 selectedWords.forEach { encompassing.union(it.bounds) }
-                drawFloatingToolbar(canvas, toLocal(encompassing))
+                drawFloatingToolbar(canvas, scaleRect(encompassing))
             }
             canvas.restoreToCount(saveCount)
         }
@@ -511,32 +375,33 @@ class CopyTextOverlayManager(
                     if (globalSelectionStart != -1) {
                         val start = globalSelectionStart.coerceAtMost(globalSelectionEnd)
                         val end = globalSelectionStart.coerceAtLeast(globalSelectionEnd)
-                        val startLocal = toLocal(allWords[start].bounds)
-                        val endLocal = toLocal(allWords[end].bounds)
+                        val startLocal = scaleRect(allWords[start].bounds)
+                        val endLocal = scaleRect(allWords[end].bounds)
                         if (isPointNear(lx, ly, startLocal.left, startLocal.top)) { dragHandleType = 1; return true }
                         if (isPointNear(lx, ly, endLocal.right, endLocal.bottom)) { dragHandleType = 2; return true }
                     }
-                    val sx = toScreenX(lx); val sy = toScreenY(ly)
-                    val nearest = findNearestWordGlobal(sx, sy)
+                    val nearest = findNearestWordGlobal(lx, ly)
                     if (nearest != -1) {
                         globalSelectionStart = nearest; globalSelectionEnd = nearest
                         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); invalidate(); return true
-                    } else { globalSelectionStart = -1; globalSelectionEnd = -1; invalidate() }
+                    } else { 
+                        globalSelectionStart = -1; globalSelectionEnd = -1; invalidate() 
+                        return false 
+                    }
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = lx - lastTouchX; val dy = ly - lastTouchY
                     lastTouchX = lx; lastTouchY = ly
                     if (isDraggingToolbar) { toolbarOffsetX += dx; toolbarOffsetY += dy; invalidate(); return true }
-                    val sx = toScreenX(lx); val sy = toScreenY(ly)
                     if (dragHandleType != 0) {
-                        val nearest = findNearestWordGlobal(sx, sy)
+                        val nearest = findNearestWordGlobal(lx, ly)
                         if (nearest != -1) {
                             if (dragHandleType == 1) globalSelectionStart = nearest else globalSelectionEnd = nearest
                             invalidate()
                         }
                         return true
                     } else if (globalSelectionStart != -1) {
-                        val nearest = findNearestWordGlobal(sx, sy)
+                        val nearest = findNearestWordGlobal(lx, ly)
                         if (nearest != -1) { globalSelectionEnd = nearest; invalidate(); return true }
                     }
                 }
@@ -548,13 +413,12 @@ class CopyTextOverlayManager(
         }
 
         private fun findNearestWordGlobal(sx: Float, sy: Float): Int {
-            var minDist = Float.MAX_VALUE; var nearest = -1
             allWords.forEachIndexed { idx, word ->
-                val dx = sx - word.bounds.centerX(); val dy = sy - word.bounds.centerY()
-                val d = dx * dx + dy * dy
-                if (d < minDist) { minDist = d; nearest = idx }
+                val scaled = scaleRect(word.bounds)
+                val expanded = RectF(scaled).apply { inset(-30f, -30f) }
+                if (expanded.contains(sx, sy)) return idx
             }
-            return if (minDist < 600 * 600) nearest else -1
+            return -1
         }
 
         private fun isPointNear(px: Float, py: Float, x: Float, y: Float): Boolean {
