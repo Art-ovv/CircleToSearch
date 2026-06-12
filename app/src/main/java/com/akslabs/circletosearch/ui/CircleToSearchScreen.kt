@@ -953,8 +953,16 @@ fun CircleToSearchScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInput(Unit) {
+                        detectTapGestures(
+                            onTap = {
+                                isUIVisible = !isUIVisible
+                            }
+                        )
+                    }
+                    .pointerInput(Unit) {
                         detectDragGestures(
                                 onDragStart = { offset ->
+                                    isUIVisible = false
                                     val rect = selectionRect
                                     if (rect != null && selectionAnim.value == 1f) {
                                         val handleSize = 64f // px for hit testing
@@ -999,7 +1007,11 @@ fun CircleToSearchScreen(
                                         currentPathPoints.add(change.position)
                                     }
                                 },
+                                onDragCancel = {
+                                    isUIVisible = true
+                                },
                                 onDragEnd = {
+                                    isUIVisible = true
                                     if (isResizing) {
                                         isResizing = false
                                         activeHandle = null
@@ -1156,6 +1168,10 @@ fun CircleToSearchScreen(
                 enter = androidx.compose.animation.slideInVertically(
                     initialOffsetY = { -it }, // Commence au-dessus de l'écran (-100%)
                     animationSpec = tween(500, easing = androidx.compose.animation.core.FastOutSlowInEasing)
+                ),
+                exit = androidx.compose.animation.slideOutVertically(
+                    targetOffsetY = { -it },
+                    animationSpec = tween(300)
                 ),
                 modifier = Modifier.align(Alignment.TopCenter).zIndex(2000f)
             ) {
