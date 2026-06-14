@@ -105,29 +105,7 @@ class CopyTextOverlayManager(
                 MaterialTheme {
                     Box(modifier = Modifier.fillMaxSize()) {
                         TopBarUI(onClose = { dismiss() })
-                        
-                        if (isScanning.value) {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(48.dp),
-                                    color = ComposeColor.White,
-                                    strokeWidth = 4.dp
-                                )
-                                Spacer(Modifier.height(16.dp))
-                                Text(
-                                    "Scanning text...", 
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = ComposeColor.White,
-                                    modifier = Modifier
-                                        .background(ComposeColor.Black.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
-                                        .padding(horizontal = 12.dp, vertical = 6.dp)
-                                )
-                            }
-                        }
-                        
+
                         statusMessage.value?.let { msg ->
                             Box(
                                 modifier = Modifier
@@ -205,7 +183,7 @@ class CopyTextOverlayManager(
                 val ocrNodes = withContext(Dispatchers.IO) {
                     com.akslabs.circletosearch.ocr.TesseractEngine.extractText(context, bitmap)
                 }
-                val sortedNodes = ocrNodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
+                val sortedNodes = ocrNodes.textNodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
                 textNodes.clear()
                 textNodes.addAll(sortedNodes)
                 updateAllWords()
@@ -252,10 +230,21 @@ class CopyTextOverlayManager(
         
         // Allocation-free drawing fields
         private val tempRect = RectF()
+        private val tempBtnRect = RectF()
         private val highlightPath = Path()
         private val encompassingRect = RectF()
         private var currentSx = 1f
         private var currentSy = 1f
+        
+        // Hoisted UI properties
+        private val dynamicSurface = try { context.getColor(android.R.color.system_surface_container_light) } catch(e: Exception) { Color.parseColor("#F3EDF7") }
+        private val dynamicPrimary = try { context.getColor(android.R.color.system_accent1_600) } catch(e: Exception) { Color.parseColor("#6750A4") }
+        private val shadowPaint = Paint(toolbarBgPaint).apply { setShadowLayer(12f * density, 0f, 4f * density, Color.BLACK and 0x2F000000) }
+        private val hPaint = Paint(toolbarActionPaint).apply { color = Color.LTGRAY; style = Paint.Style.FILL }
+        private val btnPaint = Paint(handlePaint).apply { color = dynamicPrimary }
+        private val btnTextPaint = Paint(toolbarActionPaint).apply { 
+            color = Color.WHITE; style = Paint.Style.FILL; textSize = 30f; typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD); textAlign = Paint.Align.CENTER
+        }
 
         private fun updateSelection(start: Int, end: Int) {
             globalSelectionStart = start
@@ -360,46 +349,55 @@ class CopyTextOverlayManager(
             val m = 10f * density
             
             toolbarActionPaint.textSize = 30f
-            val labelWidths = buttonLabels.map { toolbarActionPaint.measureText(it) + btnPadding * 2 }
             val dragHandleWidth = 24f * density
-            val totalWidth = labelWidths.sum() + (buttonLabels.size - 1) * btnSpacing + m * 2 + dragHandleWidth + btnSpacing
             
-            val tx = ((width - totalWidth) / 2) + toolbarOffsetX
             if (!toolbarInitialized) {
+                val labelWidths = buttonLabels.map { toolbarActionPaint.measureText(it) + btnPadding * 2 }
+                val totalWidth = labelWidths.sum() + (buttonLabels.size - 1) * btnSpacing + m * 2 + dragHandleWidth + btnSpacing
+                val tx = ((width - totalWidth) / 2)
                 toolbarOffsetY = anchor.top - (btnHeight + m * 2) - 32f
                 if (toolbarOffsetY < 150f) toolbarOffsetY = anchor.bottom + 32f
+                
+                var currentX = tx + m + dragHandleWidth + btnSpacing
+                val newButtons = mutableListOf<ToolbarButton>()
+                buttonLabels.forEachIndexed { i, label ->
+                    val bWidth = labelWidths[i]
+                    newButtons.add(ToolbarButton(label, Rect(currentX.toInt(), 0, (currentX + bWidth).toInt(), 0)))
+                    currentX += bWidth + btnSpacing
+                }
+                toolbarButtons = newButtons
                 toolbarInitialized = true
+                toolbarRect.set(tx, 0f, tx + totalWidth, 0f)
             }
+            
             val ty = toolbarOffsetY
+            val tx = toolbarRect.left + toolbarOffsetX
+            val totalWidth = toolbarRect.width()
+            
             toolbarRect.set(tx, ty, tx + totalWidth, ty + btnHeight + m * 2)
             
-            val dynamicSurface = try { context.getColor(android.R.color.system_surface_container_light) } catch(e: Exception) { Color.parseColor("#F3EDF7") }
-            val shadowPaint = Paint(toolbarBgPaint).apply { setShadowLayer(12f * density, 0f, 4f * density, Color.BLACK and 0x2F000000) }
             canvas.drawRoundRect(toolbarRect, 22f * density, 22f * density, shadowPaint)
-            canvas.drawRoundRect(toolbarRect, 22f * density, 22f * density, toolbarBgPaint.apply { color = dynamicSurface })
+            toolbarBgPaint.color = dynamicSurface
+            canvas.drawRoundRect(toolbarRect, 22f * density, 22f * density, toolbarBgPaint)
 
             val dx = tx + m
             dragHandleRect.set(dx, ty + m, dx + dragHandleWidth, ty + m + btnHeight)
-            val hPaint = Paint(toolbarActionPaint).apply { color = Color.LTGRAY; style = Paint.Style.FILL }
             canvas.drawRoundRect(dx + 8f * density, ty + m + 8f * density, dx + 16f * density, ty + m + btnHeight - 8f * density, 4f * density, 4f * density, hPaint)
 
-            var currentX = tx + m + dragHandleWidth + btnSpacing
-            val newButtons = mutableListOf<ToolbarButton>()
-            buttonLabels.forEachIndexed { i, label ->
-                val bWidth = labelWidths[i]
-                val bRect = RectF(currentX, ty + m, currentX + bWidth, ty + m + btnHeight)
-                val dynamicPrimary = try { context.getColor(android.R.color.system_accent1_600) } catch(e: Exception) { Color.parseColor("#6750A4") }
-                canvas.drawRoundRect(bRect, btnHeight / 2, btnHeight / 2, handlePaint.apply { color = dynamicPrimary })
+            val fontMetrics = btnTextPaint.fontMetrics
+            val textOffset = ((fontMetrics.descent - fontMetrics.ascent) / 2) - fontMetrics.descent
+
+            toolbarButtons.forEach { btn ->
+                val btnW = btn.rect.width().toFloat()
+                val startX = btn.rect.left.toFloat() + toolbarOffsetX
+                tempBtnRect.set(startX, ty + m, startX + btnW, ty + m + btnHeight)
                 
-                val fontMetrics = toolbarActionPaint.fontMetrics
-                val textOffset = ((fontMetrics.descent - fontMetrics.ascent) / 2) - fontMetrics.descent
-                canvas.drawText(label, bRect.centerX(), bRect.centerY() + textOffset, toolbarActionPaint.apply { 
-                    color = Color.WHITE; style = Paint.Style.FILL; textSize = 30f; typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD); textAlign = Paint.Align.CENTER
-                })
-                newButtons.add(ToolbarButton(label, Rect(bRect.left.toInt(), bRect.top.toInt(), bRect.right.toInt(), bRect.bottom.toInt())))
-                currentX += bWidth + btnSpacing
+                canvas.drawRoundRect(tempBtnRect, btnHeight / 2, btnHeight / 2, btnPaint)
+                canvas.drawText(btn.label, tempBtnRect.centerX(), tempBtnRect.centerY() + textOffset, btnTextPaint)
+                
+                // Update rect for touch events
+                btn.rect.set(tempBtnRect.left.toInt(), tempBtnRect.top.toInt(), tempBtnRect.right.toInt(), tempBtnRect.bottom.toInt())
             }
-            toolbarButtons = newButtons
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
