@@ -12,8 +12,7 @@ import com.google.zxing.Result
 import com.google.zxing.ResultPoint
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.multi.GenericMultipleBarcodeReader
-
-// Sealed class representing all supported QR / barcode result types
+import kotlinx.coroutines.flow.firstOrNull
 sealed class QrResult {
     data class Url(val url: String, val displayUrl: String) : QrResult()
     data class WiFi(val ssid: String, val password: String?, val security: String) : QrResult()
@@ -39,8 +38,8 @@ object QrScanner {
         DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)
     )
 
-    /** Scan for all barcodes / QR codes in the given bitmap. Returns empty list when none found. */
-    fun scanBitmapAll(bitmap: Bitmap): List<QrResultWithBounds> {
+    /** Scan for all barcodes / QR codes in the given bitmap. Returns a Flow of accumulating results. */
+    fun scanBitmapAll(bitmap: Bitmap): kotlinx.coroutines.flow.Flow<List<QrResultWithBounds>> = kotlinx.coroutines.flow.flow {
         val allResults = mutableListOf<QrResultWithBounds>()
         val foundTexts = mutableSetOf<String>()
 
@@ -79,19 +78,12 @@ object QrScanner {
             tileRegions.add(android.graphics.Rect(0, h - l2H, l2W, h))
             tileRegions.add(android.graphics.Rect(w - l2W, h - l2H, w, h))
 
-            // Level 3: 3x3 grid (9 tiles, ~42% size for overlap)
-            val l3W = (w * 0.42f).toInt()
-            val l3H = (h * 0.42f).toInt()
-            val xOffs = listOf(0, (w - l3W) / 2, w - l3W)
-            val yOffs = listOf(0, (h - l3H) / 2, h - l3H)
-            for (yo in yOffs) {
-                for (xo in xOffs) {
-                    tileRegions.add(android.graphics.Rect(xo, yo, xo + l3W, yo + l3H))
-                }
-            }
+
 
             // Execute all 14 passes
-            tileRegions.forEachIndexed { index, rect ->
+            for (index in tileRegions.indices) {
+                kotlinx.coroutines.yield() // Check for cancellation and yield thread
+                val rect = tileRegions[index]
                 try {
                     val subSource = baseSource.crop(rect.left, rect.top, rect.width(), rect.height())
                     val results = scanLuminanceSource(subSource)
@@ -100,17 +92,25 @@ object QrScanner {
                     
                     if (allResults.size > before) {
                         android.util.Log.d("CircleToSearch", "QrScanner: Pass $index (Rect: $rect) found ${allResults.size - before} NEW codes")
+                        emit(allResults.toList()) // Emit immediately!
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // Propagate cancellation
                 } catch (e: Exception) {
                     android.util.Log.e("CircleToSearch", "QrScanner: Pass $index failed", e)
                 }
             }
 
             android.util.Log.d("CircleToSearch", "QrScanner: Multi-res scan COMPLETE. Total codes: ${allResults.size}")
-            return allResults
+            // Optional: emit again at the end if you want to ensure the flow doesn't complete empty when nothing is found
+            if (allResults.isEmpty()) {
+                emit(emptyList())
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             android.util.Log.e("CircleToSearch", "QrScanner: Fatal error in scanBitmapAll", e)
-            return emptyList()
+            emit(emptyList())
         }
     }
 
@@ -137,20 +137,13 @@ object QrScanner {
             }
         }
 
-        // Try strategies
+        // For clean screenshots, HybridBinarizer is usually sufficient and fast.
         run(HybridBinarizer(source))
-        run(com.google.zxing.common.GlobalHistogramBinarizer(source))
-        
-        // Try inverted
-        val inverted = source.invert()
-        run(HybridBinarizer(inverted))
-        run(com.google.zxing.common.GlobalHistogramBinarizer(inverted))
 
         return results
     }
 
-    /** Compatibility single-result scan (kept for backward compat). */
-    fun scanBitmap(bitmap: Bitmap): QrResult? = scanBitmapAll(bitmap).firstOrNull()?.result
+
 
     private fun computeBounds(points: Array<ResultPoint>?): RectF? {
         if (points.isNullOrEmpty()) return null
