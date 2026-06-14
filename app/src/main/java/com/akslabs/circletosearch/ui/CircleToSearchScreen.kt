@@ -158,10 +158,8 @@ import androidx.compose.ui.zIndex
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebSettingsCompat
 import com.akslabs.circletosearch.data.SearchEngine
-import com.akslabs.circletosearch.ui.components.FriendlyMessageBubble
 import com.akslabs.circletosearch.ui.components.searchWithGoogleLens
 import com.akslabs.circletosearch.ui.theme.OverlayGradientColors
-import com.akslabs.circletosearch.utils.FriendlyMessageManager
 import com.akslabs.circletosearch.utils.ImageSearchUploader
 import com.akslabs.circletosearch.utils.ImageUtils
 import com.akslabs.circletosearch.utils.QrResult
@@ -263,9 +261,7 @@ fun CircleToSearchScreen(
     // Support Settings Sheet
     var showSettingsScreen by remember { mutableStateOf(false) }
 
-    // Friendly Message State
-    var friendlyMessage by remember { mutableStateOf("") }
-    var isMessageVisible by remember { mutableStateOf(false) }
+
     
     // Resizing state
     var isResizing by remember { mutableStateOf(false) }
@@ -284,16 +280,7 @@ fun CircleToSearchScreen(
     var showTranslationLangDialog by remember { mutableStateOf(false) }
     
 
-    LaunchedEffect(Unit) {
-        if (uiPreferences.isShowFriendlyMessages()) {
-            val manager = FriendlyMessageManager(context)
-            friendlyMessage = manager.getNextMessage()
-            delay(500) // Small delay for smooth entrance
-            isMessageVisible = true
-            delay(4000) // Show for 4 seconds
-            isMessageVisible = false
-        }
-    }
+
 
     // Search State
     var selectedEngine by remember(searchEngines) { mutableStateOf<SearchEngine>(searchEngines.first()) }
@@ -865,19 +852,7 @@ fun CircleToSearchScreen(
         ) {
             // Close button for Copy Mode (Top Left)
 
-            // Friendly Message Overlay (Top Center)
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .offset(y = 100.dp) // Offset to not cover potential top icons
-                        .zIndex(100f), // Ensure on top
-                    contentAlignment = Alignment.TopCenter
-                ) {
-                    FriendlyMessageBubble(
-                        message = friendlyMessage,
-                        visible = isMessageVisible
-                    )
-                }
+
 
             // 1. Screenshot Layer
             if (screenshot != null) {
