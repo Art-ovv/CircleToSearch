@@ -1733,8 +1733,16 @@ fun CircleToSearchScreen(
                             .pointerInput(entity) {
                                 detectTapGestures {
                                     if (entity is SmartEntity.QrCode) {
-                                        selectedQrResult = com.akslabs.circletosearch.utils.QrResultWithBounds(entity.qrResult, entity.rawText, null)
-                                        showQrSheet = true
+                                        if (entity.qrResult is com.akslabs.circletosearch.utils.QrResult.Url) {
+                                            val url = (entity.qrResult as com.akslabs.circletosearch.utils.QrResult.Url).url
+                                            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(if(!url.startsWith("http")) "https://$url" else url))
+                                            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            try { context.startActivity(intent) } catch(e: Exception){}
+                                            (context as? android.app.Activity)?.finish()
+                                        } else {
+                                            selectedQrResult = com.akslabs.circletosearch.utils.QrResultWithBounds(entity.qrResult, entity.rawText, null)
+                                            showQrSheet = true
+                                        }
                                     } else {
                                         val intent = when (entity) {
                                             is SmartEntity.Url -> android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(if(!entity.text.startsWith("http")) "https://${entity.text}" else entity.text))
@@ -1830,8 +1838,8 @@ fun CircleToSearchScreen(
                         showQrSheet = false
                         selectedQrResult = null
                     },
-                    initialResults = detectedQrCodes,
-                    initialPage = if (selectedQrResult != null) detectedQrCodes.indexOf(selectedQrResult!!) else 0
+                    initialResults = if (selectedQrResult != null) listOf(selectedQrResult!!) else detectedQrCodes,
+                    initialPage = 0
                 )
             }
         }
