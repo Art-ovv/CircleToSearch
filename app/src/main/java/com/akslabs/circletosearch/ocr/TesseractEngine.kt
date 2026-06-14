@@ -12,12 +12,23 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.firstOrNull
+import com.akslabs.circletosearch.ui.components.SmartEntity
+import com.akslabs.circletosearch.utils.QrScanner
+import android.util.Patterns
 import kotlinx.coroutines.withContext
+
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+
+data class ExtractionResult(
+    val textNodes: List<TextNode>,
+    val smartEntities: List<SmartEntity>
+)
 
 object TesseractEngine {
     private const val TAG = "TesseractEngine"
@@ -219,13 +230,16 @@ object TesseractEngine {
 
     /**
      * Extracts text from a bitmap using a cached Tesseract instance for massive speed improvements.
+     * Also detects URLs, emails, phone numbers, and QR codes natively in the same pass.
      */
-    suspend fun extractText(context: Context, bitmap: Bitmap): List<TextNode> = withContext(Dispatchers.IO) {
+    suspend fun extractText(context: Context, bitmap: Bitmap): ExtractionResult = withContext(Dispatchers.Default) {
         val dataPath = prepareTessData(context)
         // Use automatic language detection
         val lang = getOcrLanguage(context)
         val screenWidth = context.resources.displayMetrics.widthPixels
         val density = context.resources.displayMetrics.density
+
+        val qrCodes = QrScanner.scanBitmapAll(bitmap).firstOrNull() ?: emptyList()
 
         val words = ocrMutex.withLock {
             if (cachedTessApi == null || cachedLang != lang) {
@@ -354,7 +368,48 @@ object TesseractEngine {
         val allWordsWithSource = words.map { 0 to it }
         
         // Final Merge & Line Grouping
-        groupWordsIntoNodes(allWordsWithSource, screenWidth, density)
+        val textNodes = groupWordsIntoNodes(allWordsWithSource, screenWidth, density)
+
+        // Native Smart Links extraction via regex
+        val smartEntities = mutableListOf<SmartEntity>()
+        textNodes.forEach { node ->
+            val text = node.fullText
+            
+            // Extract URLs
+            val urlMatcher = Patterns.WEB_URL.matcher(text)
+            while (urlMatcher.find()) {
+                val matchText = urlMatcher.group() ?: continue
+                if (matchText.length > 4) {
+                    smartEntities.add(SmartEntity.Url(matchText, android.graphics.RectF(node.bounds)))
+                }
+            }
+
+            // Extract Emails
+            val emailMatcher = Patterns.EMAIL_ADDRESS.matcher(text)
+            while (emailMatcher.find()) {
+                val matchText = emailMatcher.group() ?: continue
+                smartEntities.add(SmartEntity.Email(matchText, android.graphics.RectF(node.bounds)))
+            }
+
+            // Extract Phone Numbers
+            val phoneMatcher = Patterns.PHONE.matcher(text)
+            while (phoneMatcher.find()) {
+                val matchText = phoneMatcher.group() ?: continue
+                if (matchText.length >= 7) {
+                    smartEntities.add(SmartEntity.Phone(matchText, android.graphics.RectF(node.bounds)))
+                }
+            }
+        }
+
+        qrCodes.forEach { qr ->
+            qr.bounds?.let { b ->
+                smartEntities.add(SmartEntity.QrCode(qr.result, qr.rawText, b))
+            }
+        }
+
+        // Entities and TextNodes gathered
+
+        ExtractionResult(textNodes, smartEntities)
     }
 
     private fun groupWordsIntoNodes(allWordsWithSource: List<Pair<Int, Word>>, screenWidth: Int, density: Float): List<TextNode> {
@@ -374,8 +429,12 @@ object TesseractEngine {
                     val overlapArea = overlap.width() * overlap.height()
                     val wArea = w.bounds.width() * w.bounds.height()
                     val existingArea = existing.bounds.width() * existing.bounds.height()
-                    // If overlap area is more than 50% of the SMALLEST word, it's a duplicate.
-                    overlapArea > minOf(wArea, existingArea) * 0.5f
+                    // If the existing word is a massive graphic block, don't let it swallow small words!
+                    if (maxOf(wArea, existingArea) > 10 * minOf(wArea, existingArea)) {
+                        false
+                    } else {
+                        overlapArea > minOf(wArea, existingArea) * 0.5f
+                    }
                 } else false
             }
             if (!isDuplicate) uniqueWords.add(w)
