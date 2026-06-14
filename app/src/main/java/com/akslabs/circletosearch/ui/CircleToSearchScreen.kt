@@ -1175,12 +1175,12 @@ fun CircleToSearchScreen(
                     }
                     Spacer(modifier = Modifier.weight(1f))
                     if (selectedEngine.name == "Google") {
-                        // Si c'est Google, on affiche ta belle typo officielle
-                        Image(
-                            painter = painterResource(id = com.akslabs.circletosearch.R.drawable.googletypo),
-                            contentDescription = "Google Search",
-                            modifier = Modifier.height(50.dp), // Hauteur ajustable selon ton PNG
-                            colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Color.White)
+                        Text(
+                            text = androidx.compose.ui.res.stringResource(id = com.akslabs.circletosearch.R.string.translate_by_google),
+                            style = MaterialTheme.typography.headlineMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
                         )
                     } else {
                         // Si c'est Bing, Yandex, etc., on garde le texte stylé d'origine
