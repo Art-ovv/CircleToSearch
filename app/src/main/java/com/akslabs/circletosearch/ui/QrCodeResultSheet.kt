@@ -37,6 +37,8 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.collect
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
@@ -148,9 +150,17 @@ fun QrCodeResultSheet(
         }
         if (bitmap == null) { isScanning = false; notFound = true; return@LaunchedEffect }
         isScanning = true; notFound = false
-        val found = withContext(Dispatchers.Default) { QrScanner.scanBitmapAll(bitmap) }
+        QrScanner.scanBitmapAll(bitmap)
+            .flowOn(Dispatchers.Default)
+            .collect { found ->
+                if (found.isNotEmpty()) {
+                    results = found
+                    notFound = false
+                    isScanning = false
+                }
+            }
         isScanning = false
-        if (found.isEmpty()) notFound = true else { results = found }
+        if (results.isEmpty()) notFound = true
     }
 
     Surface(

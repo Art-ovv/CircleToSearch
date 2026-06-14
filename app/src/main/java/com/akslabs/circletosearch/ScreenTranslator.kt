@@ -158,7 +158,7 @@ class ScreenTranslator : Closeable {
         val colorCounts = mutableMapOf<Int, Int>()
 
         // OPTIMIZATION: Expand the box outward (padding) to move from the font to the clean background.
-        val padding = 4
+        val padding = 14
         val left = (bounds.left - padding).coerceIn(0, bitmap.width - 1)
         val right = (bounds.right + padding).coerceIn(0, bitmap.width - 1)
         val top = (bounds.top - padding).coerceIn(0, bitmap.height - 1)
