@@ -55,7 +55,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.akslabs.circletosearch.ui.components.PrivacyDialog
 import com.akslabs.circletosearch.ui.theme.CircleToSearchTheme
 import com.akslabs.circletosearch.utils.PrivacyPreferences
-import com.akslabs.circletosearch.ui.components.DonateBottomSheet
+
 import com.akslabs.circletosearch.ui.components.AccessibilityDisclosureDialog
 import com.akslabs.circletosearch.ui.components.UnifiedSearchMethodSelector
 import kotlinx.coroutines.launch
@@ -126,7 +126,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
         }
     }
     
-    var showDonateSheet by remember { mutableStateOf(false) }
+
     val sheetState = rememberModalBottomSheetState()
     val scope = rememberCoroutineScope()
     
@@ -407,8 +407,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
 
             // 5. Footer
             SocialLinksRow(
-                context = context,
-                onDonateClick = { showDonateSheet = true }
+                context = context
             )
             Spacer(modifier = Modifier.height(20.dp))
             Box(
@@ -443,29 +442,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
                     prefs.edit().putBoolean("support_dialog_dismissed", true).apply()
                 }
             },
-            onDonate = {
-                showDonateSheet = true
-                showSupportDialog.value = false
-                if (dontShowAgain.value) {
-                    prefs.edit().putBoolean("support_dialog_dismissed", true).apply()
-                }
-            },
             dontShowAgain = dontShowAgain
-        )
-    }
-    
-    if (showDonateSheet) {
-        DonateBottomSheet(
-            onDismiss = { showDonateSheet = false },
-            onDonateOptionSelected = { url ->
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                    context.startActivity(intent)
-                } catch (e: Exception) {
-                    android.widget.Toast.makeText(context, "Could not open link", android.widget.Toast.LENGTH_SHORT).show()
-                }
-                showDonateSheet = false
-            }
         )
     }
 
@@ -525,8 +502,7 @@ fun isDefaultAssistant(context: android.content.Context): Boolean {
 // ... SocialLinksRow, SupportDialog, BubbleSwitch same as before ...
 @Composable
 fun SocialLinksRow(
-    context: android.content.Context,
-    onDonateClick: () -> Unit
+    context: android.content.Context
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -544,19 +520,6 @@ fun SocialLinksRow(
             Icon(
                 painter = painterResource(id = com.akslabs.circletosearch.R.drawable.github),
                 contentDescription = "Github",
-                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.padding(8.dp)
-            )
-        }
-        
-        IconButton(
-            onClick = onDonateClick, 
-            colors = IconButtonDefaults.filledTonalIconButtonColors(),
-            modifier = Modifier.padding(horizontal = 8.dp)
-        ) {
-            Icon(
-                painter = painterResource(id = com.akslabs.circletosearch.R.drawable.donation),
-                contentDescription = "Donate",
                 tint = MaterialTheme.colorScheme.onSecondaryContainer,
                 modifier = Modifier.padding(8.dp)
             )
@@ -584,7 +547,6 @@ fun SocialLinksRow(
 fun SupportDialog(
     showCount: Int,
     onDismiss: () -> Unit,
-    onDonate: () -> Unit,
     dontShowAgain: MutableState<Boolean>
 ) {
     androidx.compose.ui.window.Dialog(
@@ -747,14 +709,6 @@ fun SupportDialog(
                     ) {
                         TextButton(onClick = onDismiss) {
                             Text("Close")
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Button(
-                            onClick = onDonate,
-                            shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
-                            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp)
-                        ) {
-                            Text("Donate", fontWeight = FontWeight.Bold)
                         }
                     }
                 }

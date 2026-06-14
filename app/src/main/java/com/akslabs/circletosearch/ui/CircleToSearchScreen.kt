@@ -167,8 +167,6 @@ import com.akslabs.circletosearch.utils.QrResultWithBounds
 import com.akslabs.circletosearch.utils.QrScanner
 import com.akslabs.circletosearch.ui.qrResultShortLabel
 import com.akslabs.circletosearch.utils.UIPreferences
-import com.akslabs.circletosearch.ui.components.MoreAppsBottomSheet
-import com.akslabs.circletosearch.ui.components.DonateBottomSheet
 import android.net.Uri
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -216,8 +214,6 @@ fun CircleToSearchScreen(
     
     
     // New Sheet States
-    var showMoreAppsSheet by remember { mutableStateOf(false) }
-    var showDonateSheet by remember { mutableStateOf(false) }
 
     // Material You logic for colors
     val isDark = isSystemInDarkTheme()
@@ -1523,45 +1519,6 @@ fun CircleToSearchScreen(
                                     }
                                 }
                             }
-
-                            // More Apps
-                            BottomBarButton("More Apps", { Icon(Icons.Default.Apps, null) }) {
-                                showMoreAppsSheet = true
-                            }
-
-                            // Pin
-                            val isPinEnabled = selectedBitmap != null
-                            BottomBarButton(
-                                label = "Pin", 
-                                icon = { Icon(Icons.Default.PushPin, contentDescription = null, modifier = Modifier.size(22.dp)) },
-                                enabled = isPinEnabled
-                            ) {
-                                selectedBitmap?.let { bmp ->
-                                    CircleToSearchAccessibilityService.pinArea(bmp, selectionRect ?: android.graphics.Rect())
-                                    (context as? android.app.Activity)?.finish()
-                                }
-                            }
-
-
-                            // Donate
-                            BottomBarButton("Donate", { Icon(painterResource(id = com.akslabs.circletosearch.R.drawable.donation), null, modifier = Modifier.size(22.dp)) }) {
-                                showDonateSheet = true
-                            }
-
-
-                            // Fullscreen
-                            BottomBarButton("Fullscreen", { Icon(Icons.Default.Fullscreen, null) }) {
-                                if (screenshot != null) {
-                                    selectionRect = Rect(0, 0, screenshot.width, screenshot.height)
-                                    currentPathPoints.clear()
-                                    scope.launch { 
-                                        selectionAnim.snapTo(0f)
-                                        selectionAnim.animateTo(1f, tween(600))
-                                        selectedBitmap = screenshot
-                                        isSearching = true 
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -1868,30 +1825,6 @@ fun CircleToSearchScreen(
                     initialPage = if (selectedQrResult != null) detectedQrCodes.indexOf(selectedQrResult!!) else 0
                 )
             }
-        }
-
-        if (showMoreAppsSheet) {
-            MoreAppsBottomSheet(
-                onDismiss = { showMoreAppsSheet = false },
-                onAppSelected = { url ->
-                    try {
-                        context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url)).apply { addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) })
-                    } catch (e: Exception) {}
-                    showMoreAppsSheet = false
-                }
-            )
-        }
-
-        if (showDonateSheet) {
-            DonateBottomSheet(
-                onDismiss = { showDonateSheet = false },
-                onDonateOptionSelected = { url ->
-                    try {
-                        context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url)).apply { addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) })
-                    } catch (e: Exception) {}
-                    showDonateSheet = false
-                }
-            )
         }
 
         if (showSettingsScreen) {
