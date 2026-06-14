@@ -224,6 +224,8 @@ object TesseractEngine {
         val dataPath = prepareTessData(context)
         // Use automatic language detection
         val lang = getOcrLanguage(context)
+        val screenWidth = context.resources.displayMetrics.widthPixels
+        val density = context.resources.displayMetrics.density
 
         val words = ocrMutex.withLock {
             if (cachedTessApi == null || cachedLang != lang) {
@@ -301,6 +303,10 @@ object TesseractEngine {
                 val wordText = iterator.getUTF8Text(TessBaseAPI.PageIteratorLevel.RIL_WORD)
                 if (wordText.isNullOrBlank()) continue
 
+                // CONFIDENCE FILTER: Reject low-quality recognitions (suspected noise/icons)
+                val confidence = iterator.confidence(TessBaseAPI.PageIteratorLevel.RIL_WORD)
+                if (confidence < 60) continue
+
                 val wordRectParams = iterator.getBoundingRect(TessBaseAPI.PageIteratorLevel.RIL_WORD)
                     ?: iterator.getBoundingBox(TessBaseAPI.PageIteratorLevel.RIL_WORD)
 
@@ -310,6 +316,13 @@ object TesseractEngine {
                     Rect(wordRectParams[0], wordRectParams[1], wordRectParams[2], wordRectParams[3])
                 } else {
                     continue
+                }
+
+                // GARBAGE/ICON FILTER: Identify UI elements misidentified as text (e.g. settings dots, bars)
+                if (wordText.length <= 3) {
+                    val trimmed = wordText.trim()
+                    val isHallucination = trimmed.all { it in "|Il!i(){cCo0-_.•°~,·" }
+                    if (isHallucination) continue
                 }
 
                 if (wRect.isEmpty || wRect.width() < 2) continue
@@ -341,10 +354,10 @@ object TesseractEngine {
         val allWordsWithSource = words.map { 0 to it }
         
         // Final Merge & Line Grouping
-        groupWordsIntoNodes(allWordsWithSource)
+        groupWordsIntoNodes(allWordsWithSource, screenWidth, density)
     }
 
-    private fun groupWordsIntoNodes(allWordsWithSource: List<Pair<Int, Word>>): List<TextNode> {
+    private fun groupWordsIntoNodes(allWordsWithSource: List<Pair<Int, Word>>, screenWidth: Int, density: Float): List<TextNode> {
         if (allWordsWithSource.isEmpty()) return emptyList()
 
         // 1. Spatial Deduplication
@@ -376,24 +389,28 @@ object TesseractEngine {
             var addedToLine = false
             
             for (line in lines) {
-                val referenceWord = line.first()
-                val avgHeight = (referenceWord.bounds.height() + word.bounds.height()) / 2f
-                val verticalOverlap = Math.abs(word.bounds.centerY() - referenceWord.bounds.centerY()) < (avgHeight * 0.6f)
+                val allowedGap = 60f * density
                 
-                if (verticalOverlap) {
-                    // If words are at the same level, check that they are close horizontally
-                    val maxGap = avgHeight * 3.5f
-                    val isCloseHorizontally = line.any { w ->
-                        val gap1 = word.bounds.left - w.bounds.right
-                        val gap2 = w.bounds.left - word.bounds.right
-                        maxOf(gap1, gap2) < maxGap
-                    }
+                val isCloseAndOverlapping = line.any { w ->
+                    val topMax = maxOf(word.bounds.top, w.bounds.top)
+                    val bottomMin = minOf(word.bounds.bottom, w.bounds.bottom)
+                    val overlapHeight = maxOf(0f, bottomMin - topMax)
+                    val minHeight = minOf(word.bounds.height(), w.bounds.height())
+                    val verticalOverlap = overlapHeight >= (minHeight * 0.5f)
                     
-                    if (isCloseHorizontally) {
-                        line.add(word)
-                        addedToLine = true
-                        break
+                    if (verticalOverlap) {
+                        val g1 = word.bounds.left - w.bounds.right
+                        val g2 = w.bounds.left - word.bounds.right
+                        maxOf(g1, g2) < allowedGap
+                    } else {
+                        false
                     }
+                }
+                
+                if (isCloseAndOverlapping) {
+                    line.add(word)
+                    addedToLine = true
+                    break
                 }
             }
             
