@@ -84,13 +84,7 @@ class UIPreferences(context: Context) {
         prefs.edit().putBoolean(KEY_SHOW_GRADIENT_BORDER, isEnabled).apply()
     }
 
-    fun isShowFriendlyMessages(): Boolean {
-        return prefs.getBoolean(KEY_SHOW_FRIENDLY_MESSAGES, true)
-    }
 
-    fun setShowFriendlyMessages(isEnabled: Boolean) {
-        prefs.edit().putBoolean(KEY_SHOW_FRIENDLY_MESSAGES, isEnabled).apply()
-    }
 
     fun getSearchEngineOrder(): String? {
         return prefs.getString(KEY_SEARCH_ENGINE_ORDER, null)

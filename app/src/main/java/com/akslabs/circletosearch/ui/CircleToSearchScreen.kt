@@ -1175,11 +1175,20 @@ fun CircleToSearchScreen(
                     }
                     Spacer(modifier = Modifier.weight(1f))
                     if (selectedEngine.name == "Google") {
+                        val brush = androidx.compose.ui.graphics.Brush.linearGradient(
+                            colors = listOf(
+                                Color(0xFFE2E2E2), // Light gray
+                                Color(0xFFFFFFFF), // Pure white
+                                Color(0xFFA5C8FF)  // Soft subtle blue accent
+                            )
+                        )
                         Text(
                             text = androidx.compose.ui.res.stringResource(id = com.akslabs.circletosearch.R.string.translate_by_google),
+                            modifier = Modifier.graphicsLayer(alpha = 0.99f),
                             style = MaterialTheme.typography.headlineMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
+                                brush = brush,
+                                fontWeight = FontWeight.Black,
+                                letterSpacing = 0.5.sp
                             )
                         )
                     } else {

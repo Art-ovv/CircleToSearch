@@ -51,7 +51,6 @@ fun SettingsScreen(
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     
-    var showFriendlyMessages by remember { mutableStateOf(uiPreferences.isShowFriendlyMessages()) }
     val initialOrderString = uiPreferences.getSearchEngineOrder()
     val allEngines = SearchEngine.values()
     
@@ -72,9 +71,7 @@ fun SettingsScreen(
         mutableStateListOf(*ordered.toTypedArray())
     }
 
-    LaunchedEffect(showFriendlyMessages) {
-        uiPreferences.setShowFriendlyMessages(showFriendlyMessages)
-    }
+
 
     LaunchedEffect(engineOrder.toList()) {
         uiPreferences.setSearchEngineOrder(engineOrder.joinToString(",") { it.name })
@@ -107,15 +104,7 @@ fun SettingsScreen(
             // General Section
             SettingsSectionHeader(title = "General")
             
-            SettingsToggleItem(
-                title = "Friendly Messages",
-                subtitle = "Show random greeting messages on trigger",
-                icon = Icons.Default.ChatBubbleOutline,
-                checked = showFriendlyMessages,
-                onCheckedChange = { showFriendlyMessages = it }
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
+            
 
             UnifiedSearchMethodSelector(uiPreferences = uiPreferences)
 
