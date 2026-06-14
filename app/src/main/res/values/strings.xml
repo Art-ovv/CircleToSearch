@@ -19,5 +19,5 @@
 
 <resources>
     <string name="app_name">CircleToSearch</string>
-    <string name="translate_by_google">Translate by Circle</string>
+    <string name="translate_by_google">Circlesearch</string>
 </resources>
