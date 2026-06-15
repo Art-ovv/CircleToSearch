@@ -174,20 +174,36 @@ class ScreenTranslator : Closeable {
             return bitmap.getPixel(left, top)
         }
 
+        // Sample the box perimeter. Read each edge in one getPixels call (4 JNI
+        // calls per block) instead of ~200 per-pixel getPixel calls; this runs
+        // once per text block, so the saving scales with block count.
+        val rowWidth = right - left + 1
+        val colHeight = bottom - top + 1
+        val rowBuffer = IntArray(rowWidth)
+        val colBuffer = IntArray(colHeight)
+
         val xStep = maxOf(2, (right - left) / 50)
-        for (x in left..right step xStep) {
-            val colorTop = bitmap.getPixel(x, top)
-            val colorBottom = bitmap.getPixel(x, bottom)
-            colorCounts[colorTop] = (colorCounts[colorTop] ?: 0) + 1
-            colorCounts[colorBottom] = (colorCounts[colorBottom] ?: 0) + 1
+        bitmap.getPixels(rowBuffer, 0, rowWidth, left, top, rowWidth, 1)
+        for (x in 0 until rowWidth step xStep) {
+            val c = rowBuffer[x]
+            colorCounts[c] = (colorCounts[c] ?: 0) + 1
+        }
+        bitmap.getPixels(rowBuffer, 0, rowWidth, left, bottom, rowWidth, 1)
+        for (x in 0 until rowWidth step xStep) {
+            val c = rowBuffer[x]
+            colorCounts[c] = (colorCounts[c] ?: 0) + 1
         }
 
         val yStep = maxOf(2, (bottom - top) / 50)
-        for (y in top..bottom step yStep) {
-            val colorLeft = bitmap.getPixel(left, y)
-            val colorRight = bitmap.getPixel(right, y)
-            colorCounts[colorLeft] = (colorCounts[colorLeft] ?: 0) + 1
-            colorCounts[colorRight] = (colorCounts[colorRight] ?: 0) + 1
+        bitmap.getPixels(colBuffer, 0, 1, left, top, 1, colHeight)
+        for (y in 0 until colHeight step yStep) {
+            val c = colBuffer[y]
+            colorCounts[c] = (colorCounts[c] ?: 0) + 1
+        }
+        bitmap.getPixels(colBuffer, 0, 1, right, top, 1, colHeight)
+        for (y in 0 until colHeight step yStep) {
+            val c = colBuffer[y]
+            colorCounts[c] = (colorCounts[c] ?: 0) + 1
         }
 
         return colorCounts.maxByOrNull { it.value }?.key ?: Color.WHITE
