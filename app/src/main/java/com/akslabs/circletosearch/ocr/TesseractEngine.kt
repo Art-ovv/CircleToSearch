@@ -87,13 +87,21 @@ object TesseractEngine {
     }
 
     private fun calculateAverageLuminance(bitmap: Bitmap): Float {
-        val stepX = maxOf(1, bitmap.width / 50)
-        val stepY = maxOf(1, bitmap.height / 50)
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width == 0 || height == 0) return 255f
+
+        val stepX = maxOf(1, width / 50)
+        val stepY = maxOf(1, height / 50)
+        // Read one sampled row at a time into a width-sized buffer (~50 getPixels
+        // calls total) instead of one getPixel JNI call per sampled pixel (~2500).
+        val rowBuffer = IntArray(width)
         var sumLuminance = 0f
         var count = 0
-        for (x in 0 until bitmap.width step stepX) {
-            for (y in 0 until bitmap.height step stepY) {
-                val pixel = bitmap.getPixel(x, y)
+        for (y in 0 until height step stepY) {
+            bitmap.getPixels(rowBuffer, 0, width, 0, y, width, 1)
+            for (x in 0 until width step stepX) {
+                val pixel = rowBuffer[x]
                 val r = android.graphics.Color.red(pixel)
                 val g = android.graphics.Color.green(pixel)
                 val b = android.graphics.Color.blue(pixel)
@@ -340,6 +348,16 @@ object TesseractEngine {
                 }
 
                 if (wRect.isEmpty || wRect.width() < 2) continue
+
+                // GEOMETRIC ICON FILTER: a single recognized glyph whose box is far
+                // wider than tall is shape-impossible for a real letter/digit (even
+                // 'W'/'M' are ~square). Such a box is a horizontal bar / divider /
+                // progress UI element misread as one char (e.g. '-', '_', '~').
+                // Scoped to length 1 so genuine tiny text is never dropped.
+                if (wordText.trim().length == 1 && wRect.height() > 0) {
+                    val aspect = wRect.width().toFloat() / wRect.height().toFloat()
+                    if (aspect > 1.8f) continue
+                }
 
                 extractedWords.add(
                     Word(
