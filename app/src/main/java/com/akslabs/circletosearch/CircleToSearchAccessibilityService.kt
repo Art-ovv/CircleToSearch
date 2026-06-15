@@ -81,7 +81,11 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
 
-    private val isTranslatingFlag = AtomicBoolean(false)
+    // Guards the WHOLE capture pipeline against re-entry. takeScreenshot is
+    // OS-throttled to ~1 call/sec per display; a second concurrent trigger
+    // (e.g. a stray fast double double-tap) would otherwise silently fail with
+    // ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT - the "Failed to start" bug.
+    private val captureInProgress = AtomicBoolean(false)
     
     /** Kept by companion so scroll events can re-scan copy-text nodes. */
     internal var copyTextManager: CopyTextOverlayManager? = null
@@ -703,85 +707,119 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private fun performCapture(searchModeOverride: Boolean? = null, translateScreen: Boolean = false) {
         android.util.Log.d("CircleToSearch", "performCapture called. hasWindowManager=${windowManager != null}")
 
-        // Clear repository at the source to prevent any "ghost" flash of old data
-        BitmapRepository.clear()
-
-        if (translateScreen && !isTranslatingFlag.compareAndSet(false, true)) {
-            android.util.Log.d("CircleToSearch", "Translation already in progress, skipping")
+        // Re-entry guard over the WHOLE capture pipeline. Without this a second
+        // trigger fired before the first overlay launches races the OS
+        // screenshot throttle and dies silently (the "Failed to start" bug).
+        if (!captureInProgress.compareAndSet(false, true)) {
+            android.util.Log.d("CircleToSearch", "Capture already in progress, skipping")
             return
         }
 
+        // Clear repository at the source to prevent any "ghost" flash of old data
+        BitmapRepository.clear()
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            takeScreenshot(
-                Display.DEFAULT_DISPLAY,
-                executor,
-                object : TakeScreenshotCallback {
-                    override fun onSuccess(screenshot: ScreenshotResult) {
-                         try {
-                            val hardwareBuffer = screenshot.hardwareBuffer
-                            val colorSpace = screenshot.colorSpace
+            attemptScreenshot(searchModeOverride, translateScreen, retriesLeft = 2)
+        } else {
+            // Pre-R has no takeScreenshot; release the guard so future triggers work.
+            captureInProgress.set(false)
+        }
+    }
 
-                            val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
-                            hardwareBuffer.close() // Close buffer after getting bitmap
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
+    private fun attemptScreenshot(
+        searchModeOverride: Boolean?,
+        translateScreen: Boolean,
+        retriesLeft: Int,
+    ) {
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            executor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    try {
+                        val hardwareBuffer = screenshot.hardwareBuffer
+                        val colorSpace = screenshot.colorSpace
 
-                            if (bitmap == null) {
-                                isTranslatingFlag.set(false)
-                                return
-                            }
+                        val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
+                        hardwareBuffer.close() // Close buffer after getting bitmap
 
-                            // Copy to software bitmap
-                            val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                            bitmap.recycle() // Release original bitmap
+                        if (bitmap == null) {
+                            captureInProgress.set(false)
+                            return
+                        }
 
-                            if (copy == null) {
-                                isTranslatingFlag.set(false)
-                                return
-                            }
+                        // Copy to software bitmap
+                        val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                        bitmap.recycle() // Release original bitmap
 
-                            if (translateScreen) {
-                                serviceScope.launch {
-                                    try {
-                                        val translatedBitmap = ScreenTranslator().use { translator ->
-                                            translator.translateScreen(copy)
-                                        }
-                                        // translateScreen creates its own copy — original copy can be released immediately
-                                        copy.recycle()
-                                        withContext(Dispatchers.Main) {
-                                            BitmapRepository.setScreenshot(translatedBitmap)
-                                            launchOverlay(searchModeOverride)
-                                            isTranslatingFlag.set(false)
-                                        }
-                                    } catch (e: Exception) {
-                                        android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
-                                        // Translation failed — use original copy
-                                        withContext(Dispatchers.Main) {
-                                            BitmapRepository.setScreenshot(copy)
-                                            launchOverlay(searchModeOverride)
-                                            isTranslatingFlag.set(false)
-                                        }
+                        if (copy == null) {
+                            captureInProgress.set(false)
+                            return
+                        }
+
+                        if (translateScreen) {
+                            serviceScope.launch {
+                                try {
+                                    val translatedBitmap = ScreenTranslator().use { translator ->
+                                        translator.translateScreen(copy)
+                                    }
+                                    // translateScreen creates its own copy - original copy can be released immediately
+                                    copy.recycle()
+                                    withContext(Dispatchers.Main) {
+                                        BitmapRepository.setScreenshot(translatedBitmap)
+                                        launchOverlay(searchModeOverride)
+                                        captureInProgress.set(false)
+                                    }
+                                } catch (e: Exception) {
+                                    android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
+                                    // Translation failed - use original copy
+                                    withContext(Dispatchers.Main) {
+                                        BitmapRepository.setScreenshot(copy)
+                                        launchOverlay(searchModeOverride)
+                                        captureInProgress.set(false)
                                     }
                                 }
-                            } else {
-                                // Store in Repository (In-Memory)
-                                BitmapRepository.setScreenshot(copy)
-
-                                // Launch Overlay Immediately
-                                launchOverlay(searchModeOverride)
                             }
+                        } else {
+                            // Store in Repository (In-Memory)
+                            BitmapRepository.setScreenshot(copy)
 
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                            isTranslatingFlag.set(false)
+                            // Launch Overlay Immediately
+                            launchOverlay(searchModeOverride)
+                            captureInProgress.set(false)
                         }
-                    }
 
-                    override fun onFailure(errorCode: Int) {
-                        android.util.Log.e("CircleToSearch", "Screenshot failed with error code: $errorCode")
-                        isTranslatingFlag.set(false)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        captureInProgress.set(false)
                     }
                 }
-            )
-        }
+
+                override fun onFailure(errorCode: Int) {
+                    android.util.Log.e("CircleToSearch", "Screenshot failed with error code: $errorCode")
+
+                    // The OS throttles takeScreenshot to ~1 call/sec per display. A
+                    // too-soon call returns INTERVAL_TIME_SHORT; retry after the
+                    // throttle window instead of failing the user's tap silently.
+                    if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT && retriesLeft > 0) {
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            attemptScreenshot(searchModeOverride, translateScreen, retriesLeft - 1)
+                        }, 350L)
+                        return
+                    }
+
+                    captureInProgress.set(false)
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        android.widget.Toast.makeText(
+                            this@CircleToSearchAccessibilityService,
+                            "Couldn't capture the screen, try again",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            }
+        )
     }
 
     fun launchOverlay(searchModeOverride: Boolean? = null) {
