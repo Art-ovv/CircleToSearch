@@ -80,7 +80,7 @@ object QrScanner {
 
 
 
-            // Execute all 14 passes
+            // Execute every tile pass (1 full-screen + 4 overlapping corners)
             for (index in tileRegions.indices) {
                 kotlinx.coroutines.yield() // Check for cancellation and yield thread
                 val rect = tileRegions[index]
