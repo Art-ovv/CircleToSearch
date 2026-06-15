@@ -21,7 +21,22 @@ package com.akslabs.circletosearch.data
 
 import android.graphics.Bitmap
 
+/**
+ * In-memory handoff for the captured screenshot between the capture source
+ * (AccessibilityService / AssistSessionService) and the consumer (OverlayActivity,
+ * CopyTextOverlayManager).
+ *
+ * Producers and consumers run on different threads (capture executor, service
+ * coroutine, Main), so the field is @Volatile for cross-thread visibility; a
+ * plain var would let a consumer observe a stale reference under the JMM.
+ * Mutual exclusion between two concurrent captures is handled upstream by the
+ * captureInProgress guard in CircleToSearchAccessibilityService.
+ */
 object BitmapRepository {
+    // @Volatile gives cross-thread visibility: producers write off the capture
+    // executor / a service coroutine, consumers read on Main. Plain var would
+    // let a consumer observe a stale (null or previous) reference under the JMM.
+    @Volatile
     private var screenshot: Bitmap? = null
 
     fun setScreenshot(bitmap: Bitmap?) {
