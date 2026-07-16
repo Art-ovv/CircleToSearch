@@ -20,6 +20,7 @@
 package com.akslabs.circletosearch.data
 
 import android.graphics.Bitmap
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * In-memory handoff for the captured screenshot between the capture source
@@ -27,27 +28,29 @@ import android.graphics.Bitmap
  * CopyTextOverlayManager).
  *
  * Producers and consumers run on different threads (capture executor, service
- * coroutine, Main), so the field is @Volatile for cross-thread visibility; a
- * plain var would let a consumer observe a stale reference under the JMM.
- * Mutual exclusion between two concurrent captures is handled upstream by the
- * captureInProgress guard in CircleToSearchAccessibilityService.
+ * coroutine, Main). Atomic compare-and-set lets a long-running transformation
+ * publish only when its source is still the current screenshot.
  */
 object BitmapRepository {
-    // @Volatile gives cross-thread visibility: producers write off the capture
-    // executor / a service coroutine, consumers read on Main. Plain var would
-    // let a consumer observe a stale (null or previous) reference under the JMM.
-    @Volatile
-    private var screenshot: Bitmap? = null
+    private val screenshot = AtomicReference<Bitmap?>(null)
 
     fun setScreenshot(bitmap: Bitmap?) {
-        screenshot = bitmap
+        screenshot.set(bitmap)
     }
 
     fun getScreenshot(): Bitmap? {
-        return screenshot
+        return screenshot.get()
     }
 
     fun clear() {
-        screenshot = null
+        screenshot.set(null)
+    }
+
+    fun clearIfSame(bitmap: Bitmap): Boolean {
+        return screenshot.compareAndSet(bitmap, null)
+    }
+
+    fun compareAndSetScreenshot(expected: Bitmap, replacement: Bitmap): Boolean {
+        return screenshot.compareAndSet(expected, replacement)
     }
 }
