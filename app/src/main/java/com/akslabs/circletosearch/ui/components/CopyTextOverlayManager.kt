@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.*
 import android.net.Uri
-import android.util.Log
 import android.view.*
 import android.widget.FrameLayout
 import android.widget.Toast
@@ -30,26 +29,27 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Alignment
-import com.akslabs.circletosearch.data.BitmapRepository
-import com.akslabs.circletosearch.utils.ImageUtils
 import kotlinx.coroutines.*
 /** Simple holder for a floating-toolbar button's label and screen hit-rect. */
-private class ToolbarButton(val label: String, val rect: Rect)
+private class ToolbarButton(
+    val label: String,
+    val baseRect: Rect,
+    val hitRect: Rect = Rect(),
+)
 
 /**
  * Manages the dim+punch-out Copy Text overlay with OCR capabilities.
  */
 class CopyTextOverlayManager(
     private val context: Context,
-    private val screenshotBitmap: android.graphics.Bitmap?
+    private val screenshotBitmap: android.graphics.Bitmap?,
 ) {
     private var dimView: DimPunchOutView? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var scanJob: Job? = null
+    @Volatile private var disposed = false
     private var onDismissCallback: (() -> Unit)? = null
     private var onAnalysisCompleteCallback: ((Int) -> Unit)? = null
 
-    private val isScanning = mutableStateOf(false)
     private val statusMessage = mutableStateOf<String?>(null)
     private val textNodes = mutableListOf<TextNode>()
     private var allWords: List<Word> = emptyList()
@@ -66,7 +66,7 @@ class CopyTextOverlayManager(
      * Starts text analysis. Called automatically on startup.
      */
     fun startAnalysis() {
-        // No-op: getOverlayView already calls scanNodes natively. Prevents double-scanning.
+        // The Compose screen owns the single OCR pass and publishes nodes via updateNodes().
     }
 
     /**
@@ -77,10 +77,39 @@ class CopyTextOverlayManager(
     /**
      * Checks if scanning is currently in progress.
      */
-    fun isScanning(): Boolean = isScanning.value
+    fun isScanning(): Boolean = false
 
     private fun updateAllWords() {
         allWords = textNodes.flatMap { it.words }
+    }
+
+    /** Publishes the screen-owned OCR result without starting a duplicate native scan. */
+    fun updateNodes(nodes: List<TextNode>) {
+        if (disposed) return
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            scope.launch { applyNodes(nodes) }
+        } else {
+            applyNodes(nodes)
+        }
+    }
+
+    private fun applyNodes(nodes: List<TextNode>) {
+        if (disposed) return
+        val sortedNodes = nodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
+        val nodeOrderChanged = textNodes.map { it.id } != sortedNodes.map { it.id }
+        textNodes.clear()
+        textNodes.addAll(sortedNodes)
+        updateAllWords()
+        if (
+            nodeOrderChanged ||
+            globalSelectionStart !in allWords.indices ||
+            globalSelectionEnd !in allWords.indices
+        ) {
+            globalSelectionStart = -1
+            globalSelectionEnd = -1
+        }
+        onAnalysisCompleteCallback?.invoke(textNodes.size)
+        dimView?.invalidate()
     }
     
     // Selection state
@@ -127,8 +156,6 @@ class CopyTextOverlayManager(
         }
         container.addView(topBar)
 
-        scanNodes(view)
-        
         return container
     }
 
@@ -157,46 +184,18 @@ class CopyTextOverlayManager(
     private fun Int.toComposeColor(): ComposeColor = ComposeColor(this)
 
     fun dismiss() {
-        scanJob?.cancel()
+        if (disposed) return
+        disposed = true
+        scope.cancel()
         dimView = null
-        onDismissCallback?.invoke()
+        val callback = onDismissCallback
         onDismissCallback = null
+        callback?.invoke()
     }
 
     fun rescanNodes() {
-        dimView?.let { scanNodes(it) }
-    }
-
-    private fun scanNodes(view: View) {
-        scanJob?.cancel()
-        scanJob = scope.launch(Dispatchers.Main) {
-            isScanning.value = true
-            val bitmap = screenshotBitmap ?: BitmapRepository.getScreenshot()
-
-            if (bitmap == null) {
-                isScanning.value = false
-                view.invalidate()
-                return@launch
-            }
-
-            try {
-                val ocrNodes = withContext(Dispatchers.IO) {
-                    com.akslabs.circletosearch.ocr.TesseractEngine.extractText(context, bitmap)
-                }
-                val sortedNodes = ocrNodes.textNodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
-                textNodes.clear()
-                textNodes.addAll(sortedNodes)
-                updateAllWords()
-                
-                onAnalysisCompleteCallback?.invoke(textNodes.size)
-                Log.d("CopyTextOverlay", "Analysis complete: ${textNodes.size} total nodes")
-            } catch (e: Throwable) { // Catch Throwable to prevent silent OutOfMemoryErrors from locking UI
-                Log.e("CopyTextOverlay", "Extraction failed: ${e.message}")
-            } finally {
-                isScanning.value = false
-                view.invalidate()
-            }
-        }
+        // The captured bitmap is immutable; accessibility scroll events do not change it.
+        dimView?.invalidate()
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -223,6 +222,9 @@ class CopyTextOverlayManager(
         private var dragHandleRect = RectF()
         private var toolbarOffsetX = 0f
         private var toolbarOffsetY = 0f
+        private var toolbarBaseLeft = 0f
+        private var toolbarBaseWidth = 0f
+        private var toolbarLayoutWidth = 0
         private var isDraggingToolbar = false
         private var toolbarInitialized = false
         private var lastTouchX = 0f
@@ -351,10 +353,11 @@ class CopyTextOverlayManager(
             toolbarActionPaint.textSize = 30f
             val dragHandleWidth = 24f * density
             
-            if (!toolbarInitialized) {
+            if (!toolbarInitialized || toolbarLayoutWidth != width) {
                 val labelWidths = buttonLabels.map { toolbarActionPaint.measureText(it) + btnPadding * 2 }
                 val totalWidth = labelWidths.sum() + (buttonLabels.size - 1) * btnSpacing + m * 2 + dragHandleWidth + btnSpacing
                 val tx = ((width - totalWidth) / 2)
+                toolbarOffsetX = 0f
                 toolbarOffsetY = anchor.top - (btnHeight + m * 2) - 32f
                 if (toolbarOffsetY < 150f) toolbarOffsetY = anchor.bottom + 32f
                 
@@ -366,13 +369,15 @@ class CopyTextOverlayManager(
                     currentX += bWidth + btnSpacing
                 }
                 toolbarButtons = newButtons
+                toolbarBaseLeft = tx
+                toolbarBaseWidth = totalWidth
+                toolbarLayoutWidth = width
                 toolbarInitialized = true
-                toolbarRect.set(tx, 0f, tx + totalWidth, 0f)
             }
             
             val ty = toolbarOffsetY
-            val tx = toolbarRect.left + toolbarOffsetX
-            val totalWidth = toolbarRect.width()
+            val tx = toolbarBaseLeft + toolbarOffsetX
+            val totalWidth = toolbarBaseWidth
             
             toolbarRect.set(tx, ty, tx + totalWidth, ty + btnHeight + m * 2)
             
@@ -388,15 +393,15 @@ class CopyTextOverlayManager(
             val textOffset = ((fontMetrics.descent - fontMetrics.ascent) / 2) - fontMetrics.descent
 
             toolbarButtons.forEach { btn ->
-                val btnW = btn.rect.width().toFloat()
-                val startX = btn.rect.left.toFloat() + toolbarOffsetX
+                val btnW = btn.baseRect.width().toFloat()
+                val startX = btn.baseRect.left.toFloat() + toolbarOffsetX
                 tempBtnRect.set(startX, ty + m, startX + btnW, ty + m + btnHeight)
                 
                 canvas.drawRoundRect(tempBtnRect, btnHeight / 2, btnHeight / 2, btnPaint)
                 canvas.drawText(btn.label, tempBtnRect.centerX(), tempBtnRect.centerY() + textOffset, btnTextPaint)
                 
                 // Update rect for touch events
-                btn.rect.set(tempBtnRect.left.toInt(), tempBtnRect.top.toInt(), tempBtnRect.right.toInt(), tempBtnRect.bottom.toInt())
+                btn.hitRect.set(tempBtnRect.left.toInt(), tempBtnRect.top.toInt(), tempBtnRect.right.toInt(), tempBtnRect.bottom.toInt())
             }
         }
 
@@ -406,7 +411,7 @@ class CopyTextOverlayManager(
                 MotionEvent.ACTION_DOWN -> {
                     lastTouchX = lx; lastTouchY = ly
                     for (btn in toolbarButtons) {
-                        if (Rect(btn.rect).apply { inset(-24, -24) }.contains(lx.toInt(), ly.toInt())) {
+                        if (Rect(btn.hitRect).apply { inset(-24, -24) }.contains(lx.toInt(), ly.toInt())) {
                             handleToolbarAction(btn.label); return true
                         }
                     }
