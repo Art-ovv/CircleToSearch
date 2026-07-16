@@ -4,43 +4,290 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.RectF
+import android.util.Patterns
 import android.util.Log
+import com.akslabs.circletosearch.ui.components.SmartEntity
 import com.akslabs.circletosearch.ui.components.TextNode
 import com.akslabs.circletosearch.ui.components.Word
+import com.akslabs.circletosearch.utils.QrScanner
 import com.googlecode.tesseract.android.TessBaseAPI
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.firstOrNull
-import com.akslabs.circletosearch.ui.components.SmartEntity
-import com.akslabs.circletosearch.utils.QrScanner
-import android.util.Patterns
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.lastOrNull
 import kotlinx.coroutines.withContext
-
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.lang.ref.WeakReference
 import java.util.UUID
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 data class ExtractionResult(
     val textNodes: List<TextNode>,
     val smartEntities: List<SmartEntity>
 )
 
+data class ModelImportResult(
+    val success: Boolean,
+    val message: String,
+)
+
+internal data class OcrCandidate(
+    val word: Word,
+    val confidence: Float,
+    val textLine: Int,
+)
+
+internal fun filterOcrCandidates(
+    candidates: List<OcrCandidate>,
+    density: Float,
+): List<Word> = candidates.mapNotNull { candidate ->
+    val text = candidate.word.text.trim()
+    val alphanumericCount = text.count(Char::isLetterOrDigit)
+    if (alphanumericCount == 0) return@mapNotNull null
+
+    val bounds = candidate.word.bounds
+    val width = bounds.right - bounds.left
+    val height = bounds.bottom - bounds.top
+    if (width < 2f || height < 2f) return@mapNotNull null
+
+    val hasTextPeer = candidates.any { peer ->
+        if (peer === candidate) return@any false
+        if (peer.word.text.count(Char::isLetterOrDigit) < 2 || peer.confidence < 55f) return@any false
+
+        val peerBounds = peer.word.bounds
+        val peerHeight = (peerBounds.bottom - peerBounds.top).coerceAtLeast(1f)
+        val heightRatio = height / peerHeight
+        val verticalOverlap = minOf(bounds.bottom, peerBounds.bottom) -
+            maxOf(bounds.top, peerBounds.top)
+        val requiredOverlap = if (peer.textLine == candidate.textLine) 0.5f else 0.7f
+        val horizontalGap = maxOf(
+            bounds.left - peerBounds.right,
+            peerBounds.left - bounds.right,
+            0f,
+        )
+        heightRatio in 0.65f..1.35f &&
+            verticalOverlap >= minOf(height, peerHeight) * requiredOverlap &&
+            horizontalGap <= maxOf(32f * density, maxOf(height, peerHeight) * 3f)
+    }
+
+    val aspectRatio = width / height
+    val looksLikeCompactIcon = alphanumericCount <= 4 &&
+        height >= 20f * density &&
+        aspectRatio in 0.55f..1.80f
+
+    if (looksLikeCompactIcon && !hasTextPeer) {
+        val alphanumeric = text.filter(Char::isLetterOrDigit)
+        val repeatedGlyph = alphanumeric.length > 1 && alphanumeric.toSet().size == 1
+        val standaloneConfidence = when {
+            alphanumericCount == 1 && alphanumeric.single().isDigit() -> Float.POSITIVE_INFINITY
+            alphanumericCount == 1 -> 97f
+            alphanumericCount == 2 -> 94f
+            else -> 98f
+        }
+        if (repeatedGlyph || candidate.confidence < standaloneConfidence) {
+            return@mapNotNull null
+        }
+    }
+    if (alphanumericCount >= 3) {
+        return@mapNotNull candidate.word.takeIf {
+            candidate.confidence >= 55f || (hasTextPeer && candidate.confidence >= 45f)
+        }
+    }
+
+    when {
+        hasTextPeer && candidate.confidence >= 50f -> candidate.word
+        candidate.confidence >= 88f -> candidate.word
+        else -> null
+    }
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
 object TesseractEngine {
     private const val TAG = "TesseractEngine"
-    private var isPrepared = false
 
     // Cache Tesseract instance to avoid loading 30MB+ dictionaries from disk on every scan
     private var cachedTessApi: TessBaseAPI? = null
     private var cachedLang: String? = null
+    private var cachedWordsBitmap = WeakReference<Bitmap>(null)
+    private var cachedWordsLanguage: String? = null
+    private var cachedWords: List<Pair<Int, Word>>? = null
     private val ocrMutex = Mutex()
+    private val recognitionDispatcher = Dispatchers.Default.limitedParallelism(2)
+    private val preparerLock = Any()
+    private var dataPreparer: TessDataPreparer? = null
 
     // Default languages: eng + rus for Cyrillic support
     private val defaultLanguages = listOf("eng", "rus")
+
+    /**
+     * Pre-initializes Tesseract engine in background so the first real OCR call
+     * doesn't pay the ~2-4 second cold-start cost of loading 30MB+ model files.
+     * Safe to call multiple times; no-ops if already warmed up.
+     */
+    suspend fun warmUp(context: Context) {
+        val appContext = context.applicationContext
+        val dataPath = withContext(Dispatchers.IO) { prepareTessData(appContext) }
+        val lang = getOcrLanguage(appContext)
+
+        withContext(recognitionDispatcher) {
+            ocrMutex.withLock {
+                if (ensureTessApi(dataPath, lang) != null) {
+                    Log.d(TAG, "Warm-up complete: Tesseract ready for lang=$lang")
+                } else {
+                    Log.e(TAG, "Warm-up failed: could not init Tesseract for lang=$lang")
+                }
+            }
+        }
+    }
+
+    suspend fun releaseCachedEngine() = withContext(recognitionDispatcher) {
+        ocrMutex.withLock {
+            cachedTessApi?.recycle()
+            cachedTessApi = null
+            cachedLang = null
+            clearWordCache()
+        }
+    }
+
+    /** Must be called while [ocrMutex] is held. */
+    private fun clearWordCache() {
+        cachedWordsBitmap.clear()
+        cachedWordsLanguage = null
+        cachedWords = null
+    }
+
+    /** Must be called while [ocrMutex] is held. */
+    private fun ensureTessApi(dataPath: String, lang: String): TessBaseAPI? {
+        cachedTessApi?.takeIf { cachedLang == lang }?.let { return it }
+
+        cachedTessApi?.recycle()
+        cachedTessApi = null
+        cachedLang = null
+
+        val candidate = TessBaseAPI()
+        return try {
+            if (candidate.init(dataPath, lang)) {
+                cachedTessApi = candidate
+                cachedLang = lang
+                candidate
+            } else {
+                candidate.recycle()
+                null
+            }
+        } catch (error: Throwable) {
+            candidate.recycle()
+            throw error
+        }
+    }
+
+    private data class RecognitionTransform(
+        val recognitionScaleX: Float,
+        val recognitionScaleY: Float,
+        val border: Float,
+        val processedOffsetX: Float,
+        val processedOffsetY: Float,
+        val processedScale: Float,
+        val sourceWidth: Int,
+        val sourceHeight: Int,
+    ) {
+        fun map(rect: Rect): RectF = RectF(
+            ((rect.left / recognitionScaleX - border + processedOffsetX) / processedScale)
+                .coerceIn(0f, sourceWidth.toFloat()),
+            ((rect.top / recognitionScaleY - border + processedOffsetY) / processedScale)
+                .coerceIn(0f, sourceHeight.toFloat()),
+            ((rect.right / recognitionScaleX - border + processedOffsetX) / processedScale)
+                .coerceIn(0f, sourceWidth.toFloat()),
+            ((rect.bottom / recognitionScaleY - border + processedOffsetY) / processedScale)
+                .coerceIn(0f, sourceHeight.toFloat()),
+        )
+    }
+
+    private fun recognizeWords(
+        api: TessBaseAPI,
+        image: Bitmap,
+        density: Float,
+        jobContext: kotlin.coroutines.CoroutineContext,
+        transform: RecognitionTransform,
+        canonicalPolarity: Boolean,
+    ): List<Word> {
+        jobContext.ensureActive()
+        api.pageSegMode = TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT
+        if (!api.setVariable("thresholding_method", "2")) {
+            Log.w(TAG, "Sauvola thresholding is unavailable; using Tesseract default")
+        }
+        api.setVariable("invert_threshold", if (canonicalPolarity) "0.0" else "0.7")
+
+        return try {
+            api.setImage(image)
+            api.getUTF8Text()
+            jobContext.ensureActive()
+
+            val iterator = api.resultIterator ?: return emptyList()
+            try {
+                val candidates = mutableListOf<OcrCandidate>()
+                var iteration = 0
+                var textLine = -1
+                iterator.begin()
+                do {
+                    if (iteration++ % 32 == 0) jobContext.ensureActive()
+                    if (
+                        textLine == -1 ||
+                        iterator.isAtBeginningOf(TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)
+                    ) {
+                        textLine++
+                    }
+                    val wordText = iterator.getUTF8Text(TessBaseAPI.PageIteratorLevel.RIL_WORD)
+                    if (wordText.isNullOrBlank()) continue
+
+                    val confidence = iterator.confidence(TessBaseAPI.PageIteratorLevel.RIL_WORD)
+                    if (confidence < 45f) continue
+
+                    val wordRectParams = iterator.getBoundingRect(TessBaseAPI.PageIteratorLevel.RIL_WORD)
+                        ?: iterator.getBoundingBox(TessBaseAPI.PageIteratorLevel.RIL_WORD)
+                    val wordRect = when (wordRectParams) {
+                        is Rect -> wordRectParams
+                        is IntArray -> Rect(
+                            wordRectParams[0],
+                            wordRectParams[1],
+                            wordRectParams[2],
+                            wordRectParams[3],
+                        )
+                        else -> continue
+                    }
+                    val mappedBounds = transform.map(wordRect)
+                    if (mappedBounds.right - mappedBounds.left < 2f) continue
+                    if (mappedBounds.bottom - mappedBounds.top < 2f) continue
+
+                    candidates += OcrCandidate(
+                        word = Word(
+                            text = wordText,
+                            index = 0,
+                            startIndex = 0,
+                            endIndex = wordText.length,
+                            bounds = mappedBounds,
+                        ),
+                        confidence = confidence,
+                        textLine = textLine,
+                    )
+                } while (iterator.next(TessBaseAPI.PageIteratorLevel.RIL_WORD))
+                filterOcrCandidates(candidates, density)
+            } finally {
+                iterator.delete()
+            }
+        } finally {
+            api.clear()
+        }
+    }
 
     private val latinToCyrillic = mapOf(
         'A' to 'А', 'a' to 'а',
@@ -86,59 +333,16 @@ object TesseractEngine {
         return t
     }
 
-    private fun calculateAverageLuminance(bitmap: Bitmap): Float {
-        val width = bitmap.width
-        val height = bitmap.height
-        if (width == 0 || height == 0) return 255f
-
-        val stepX = maxOf(1, width / 50)
-        val stepY = maxOf(1, height / 50)
-        // Read one sampled row at a time into a width-sized buffer (~50 getPixels
-        // calls total) instead of one getPixel JNI call per sampled pixel (~2500).
-        val rowBuffer = IntArray(width)
-        var sumLuminance = 0f
-        var count = 0
-        for (y in 0 until height step stepY) {
-            bitmap.getPixels(rowBuffer, 0, width, 0, y, width, 1)
-            for (x in 0 until width step stepX) {
-                val pixel = rowBuffer[x]
-                val r = android.graphics.Color.red(pixel)
-                val g = android.graphics.Color.green(pixel)
-                val b = android.graphics.Color.blue(pixel)
-                sumLuminance += (0.299f * r + 0.587f * g + 0.114f * b)
-                count++
-            }
-        }
-        return if (count > 0) sumLuminance / count else 255f
-    }
-
     fun prepareTessData(context: Context): String {
-        val filesDir = context.filesDir.absolutePath
-        // OPTIMIZATION: Immediate exit if files are already verified in this session
-        if (isPrepared) return filesDir
-        val tessDir = File(filesDir, "tessdata")
-        if (!tessDir.exists()) {
-            tessDir.mkdirs()
+        val appContext = context.applicationContext
+        val preparer = synchronized(preparerLock) {
+            dataPreparer ?: TessDataPreparer(
+                filesDir = appContext.filesDir,
+                languages = defaultLanguages,
+                openAsset = appContext.assets::open,
+            ).also { dataPreparer = it }
         }
-
-        // Copy default models
-        for (lang in defaultLanguages) {
-            val langFile = File(tessDir, "$lang.traineddata")
-            if (!langFile.exists()) {
-                Log.d(TAG, "Copying $lang.traineddata from assets...")
-                try {
-                    context.assets.open("tessdata/$lang.traineddata").use { input ->
-                        FileOutputStream(langFile).use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to copy $lang.traineddata: ${e.message}")
-                }
-            }
-        }
-        isPrepared = true
-        return filesDir
+        return preparer.prepare()
     }
 
     fun getAvailableModels(context: Context): List<String> {
@@ -199,40 +403,82 @@ object TesseractEngine {
         return false
     }
 
-    fun importModel(context: Context, uri: android.net.Uri, callback: (Boolean, String) -> Unit) {
+    suspend fun importModel(context: Context, uri: android.net.Uri): ModelImportResult {
+        val appContext = context.applicationContext
+        return try {
+            val fileName = withContext(Dispatchers.IO) {
+                val displayName = appContext.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (!cursor.moveToFirst()) return@use null
+                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex == -1) null else cursor.getString(nameIndex)
+                } ?: "unknown.traineddata"
+                File(displayName).name
+            }
+
+            if (!fileName.endsWith(".traineddata", ignoreCase = true)) {
+                return ModelImportResult(false, "File must be a .traineddata Tesseract model.")
+            }
+
+            withContext(Dispatchers.IO) {
+                val tessDir = File(appContext.filesDir, "tessdata")
+                check(tessDir.isDirectory || tessDir.mkdirs()) {
+                    "Unable to create ${tessDir.absolutePath}"
+                }
+                val destination = File(tessDir, fileName)
+                val temporary = File(tessDir, ".${destination.name}.import.tmp")
+                try {
+                    val input = checkNotNull(appContext.contentResolver.openInputStream(uri)) {
+                        "Unable to open selected model"
+                    }
+                    input.use {
+                        FileOutputStream(temporary).use { output ->
+                            it.copyTo(output)
+                            output.fd.sync()
+                        }
+                    }
+                    check(temporary.length() > 0L) { "Selected model is empty" }
+                    moveImportedModel(temporary, destination)
+                } finally {
+                    temporary.delete()
+                }
+            }
+
+            withContext(recognitionDispatcher) {
+                ocrMutex.withLock {
+                    cachedTessApi?.recycle()
+                    cachedTessApi = null
+                    cachedLang = null
+                    clearWordCache()
+                }
+            }
+
+            Log.d(TAG, "Imported model: $fileName")
+            ModelImportResult(
+                true,
+                "Successfully imported ${fileName.removeSuffix(".traineddata").uppercase()} model!",
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Error importing model", error)
+            ModelImportResult(false, "Failed to import model")
+        }
+    }
+
+    private fun moveImportedModel(source: File, destination: File) {
         try {
-            val cursor = context.contentResolver.query(uri, null, null, null, null)
-            var fileName = "unknown.traineddata"
-            if (cursor != null && cursor.moveToFirst()) {
-                val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                if (nameIndex != -1) {
-                    fileName = cursor.getString(nameIndex)
-                }
-                cursor.close()
-            }
-
-            if (!fileName.endsWith(".traineddata")) {
-                callback(false, "File must be a .traineddata Tesseract model.")
-                return
-            }
-
-            val tessDir = File(context.filesDir, "tessdata")
-            if (!tessDir.exists()) tessDir.mkdirs()
-
-            val destFile = File(tessDir, fileName)
-            
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(destFile).use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            Log.d(TAG, "Imported model to ${destFile.absolutePath}")
-            callback(true, "Successfully imported ${fileName.removeSuffix(".traineddata").uppercase()} model!")
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error importing model: ${e.message}")
-            callback(false, "Failed to import model")
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
         }
     }
 
@@ -240,153 +486,194 @@ object TesseractEngine {
      * Extracts text from a bitmap using a cached Tesseract instance for massive speed improvements.
      * Also detects URLs, emails, phone numbers, and QR codes natively in the same pass.
      */
-    suspend fun extractText(context: Context, bitmap: Bitmap): ExtractionResult = withContext(Dispatchers.Default) {
-        val dataPath = prepareTessData(context)
+    suspend fun extractText(
+        context: Context,
+        bitmap: Bitmap,
+        includeQrCodes: Boolean = true,
+    ): ExtractionResult = withContext(recognitionDispatcher) {
+        require(!bitmap.isRecycled) { "Cannot run OCR on a recycled bitmap" }
+
+        val appContext = context.applicationContext
+        val dataPath = withContext(Dispatchers.IO) { prepareTessData(appContext) }
         // Use automatic language detection
-        val lang = getOcrLanguage(context)
-        val screenWidth = context.resources.displayMetrics.widthPixels
-        val density = context.resources.displayMetrics.density
+        val lang = getOcrLanguage(appContext)
+        val screenWidth = bitmap.width
+        val density = appContext.resources.displayMetrics.density
+        val jobContext = currentCoroutineContext()
 
-        val qrCodes = QrScanner.scanBitmapAll(bitmap).firstOrNull() ?: emptyList()
-
-        val words = ocrMutex.withLock {
-            if (cachedTessApi == null || cachedLang != lang) {
-                cachedTessApi?.recycle()
-                cachedTessApi = TessBaseAPI()
-                val success = cachedTessApi?.init(dataPath, lang) ?: false
-                if (!success) {
-                    cachedTessApi?.recycle()
-                    cachedTessApi = null
-                    return@withLock emptyList<Word>()
-                }
-                cachedLang = lang
-            }
-
-            // SPEED AND QUALITY OPTIMIZATION:
-            // Scaling + Conversion to B&W with high contrast.
-            val maxDim = Math.max(bitmap.width, bitmap.height).toFloat()
-            val targetMax = 2048f
-            // UI text can be small. Scale by 1.5x up to a hard cap of ~2048px.
-            val scaleFactor = Math.min(1.5f, targetMax / maxDim).coerceAtLeast(1f)
-            
-            val scaledWidth = (bitmap.width * scaleFactor).toInt()
-            val scaledHeight = (bitmap.height * scaleFactor).toInt()
-            
-            val processedBitmap = Bitmap.createBitmap(scaledWidth, scaledHeight, Bitmap.Config.ARGB_8888)
-            val canvas = android.graphics.Canvas(processedBitmap)
-            val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG) // Bilinear filtering
-            
-            // Smart Binarization & Inversion
-            val avgLuminance = calculateAverageLuminance(bitmap)
-            val isDarkMode = avgLuminance < 128f
-
-            val colorMatrix = android.graphics.ColorMatrix()
-            colorMatrix.setSaturation(0f) // Grayscale
-            
-            if (isDarkMode) {
-                // Invert the image (makes text black and backgrounds white)
-                colorMatrix.postConcat(android.graphics.ColorMatrix(floatArrayOf(
-                    -1f, 0f, 0f, 0f, 255f,
-                    0f, -1f, 0f, 0f, 255f,
-                    0f, 0f, -1f, 0f, 255f,
-                    0f, 0f, 0f, 1f, 0f
-                )))
-            }
-
-            // Harsh contrast multiplier to force binarization and crush background noise
-            val contrast = 5.0f
-            val translate = (-128f * contrast) + 128f
-            colorMatrix.postConcat(android.graphics.ColorMatrix(floatArrayOf(
-                contrast, 0f, 0f, 0f, translate,
-                0f, contrast, 0f, 0f, translate,
-                0f, 0f, contrast, 0f, translate,
-                0f, 0f, 0f, 1f, 0f
-            )))
-            
-            paint.colorFilter = android.graphics.ColorMatrixColorFilter(colorMatrix)
-            
-            val matrix = android.graphics.Matrix()
-            matrix.postScale(scaleFactor, scaleFactor)
-            canvas.drawBitmap(bitmap, matrix, paint)
-
-            val api = cachedTessApi!!
-            
-            // Set Page Segmentation Mode to Sparse Text (11) to handle non-linear chat bubbles
-            api.pageSegMode = TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT
-            
-            api.setImage(processedBitmap)
-            api.getUTF8Text() // Trigger recognition
-
-            val iterator = api.resultIterator ?: return@withLock emptyList<Word>()
-            val extractedWords = mutableListOf<Word>()
-
-            iterator.begin()
-            do {
-                val wordText = iterator.getUTF8Text(TessBaseAPI.PageIteratorLevel.RIL_WORD)
-                if (wordText.isNullOrBlank()) continue
-
-                // CONFIDENCE FILTER: Reject low-quality recognitions (suspected noise/icons)
-                val confidence = iterator.confidence(TessBaseAPI.PageIteratorLevel.RIL_WORD)
-                if (confidence < 60) continue
-
-                val wordRectParams = iterator.getBoundingRect(TessBaseAPI.PageIteratorLevel.RIL_WORD)
-                    ?: iterator.getBoundingBox(TessBaseAPI.PageIteratorLevel.RIL_WORD)
-
-                val wRect = if (wordRectParams is Rect) {
-                    wordRectParams
-                } else if (wordRectParams is IntArray) {
-                    Rect(wordRectParams[0], wordRectParams[1], wordRectParams[2], wordRectParams[3])
-                } else {
-                    continue
-                }
-
-                // GARBAGE/ICON FILTER: Identify UI elements misidentified as text (e.g. settings dots, bars)
-                if (wordText.length <= 3) {
-                    val trimmed = wordText.trim()
-                    val isHallucination = trimmed.all { it in "|Il!i(){cCo0-_.•°~,·" }
-                    if (isHallucination) continue
-                }
-
-                if (wRect.isEmpty || wRect.width() < 2) continue
-
-                // GEOMETRIC ICON FILTER: a single recognized glyph whose box is far
-                // wider than tall is shape-impossible for a real letter/digit (even
-                // 'W'/'M' are ~square). Such a box is a horizontal bar / divider /
-                // progress UI element misread as one char (e.g. '-', '_', '~').
-                // Scoped to length 1 so genuine tiny text is never dropped.
-                if (wordText.trim().length == 1 && wRect.height() > 0) {
-                    val aspect = wRect.width().toFloat() / wRect.height().toFloat()
-                    if (aspect > 1.8f) continue
-                }
-
-                extractedWords.add(
-                    Word(
-                        text = wordText,
-                        index = 0,
-                        startIndex = 0,
-                        endIndex = wordText.length,
-                        // Return coordinates back to the original screen scale
-                        bounds = RectF(
-                            wRect.left / scaleFactor,
-                            wRect.top / scaleFactor,
-                            wRect.right / scaleFactor,
-                            wRect.bottom / scaleFactor
-                        )
-                    )
-                )
-            } while (iterator.next(TessBaseAPI.PageIteratorLevel.RIL_WORD))
-
-            iterator.delete()
-            api.clear() // Clear image buffer from native memory to prevent leaks, but keep models loaded
-            processedBitmap.recycle()
-            extractedWords
+        // Run QR scanning in parallel with OCR instead of sequentially.
+        // This saves 500ms-2s since both are CPU-heavy and independent.
+        val qrDeferred: kotlinx.coroutines.Deferred<List<com.akslabs.circletosearch.utils.QrResultWithBounds>>? = if (includeQrCodes) {
+            async { QrScanner.scanBitmapAll(bitmap).lastOrNull() ?: emptyList() }
+        } else {
+            null
         }
 
-        // Wrapper to maintain compatibility with groupWordsIntoNodes
-        val allWordsWithSource = words.map { 0 to it }
+        val allWordsWithSource = ocrMutex.withLock {
+            jobContext.ensureActive()
+            if (cachedWordsBitmap.get() === bitmap && cachedWordsLanguage == lang) {
+                return@withLock cachedWords.orEmpty()
+            }
+            val api = ensureTessApi(dataPath, lang)
+                ?: return@withLock emptyList<Pair<Int, Word>>()
+
+            // Preserve RGB for the primary pass. A bounded canonical fallback below handles
+            // light text inside dark/low-contrast regions without inverting the whole screen.
+            val maxDim = Math.max(bitmap.width, bitmap.height).toFloat()
+            val targetMax = 2560f
+            val scaleFactor = Math.min(1f, targetMax / maxDim)
+            
+            val scaledWidth = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
+            val scaledHeight = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
+            val canUseSourceDirectly = scaledWidth == bitmap.width &&
+                scaledHeight == bitmap.height &&
+                bitmap.config == Bitmap.Config.ARGB_8888
+            val processedBitmap = if (canUseSourceDirectly) {
+                bitmap
+            } else {
+                Bitmap.createBitmap(scaledWidth, scaledHeight, Bitmap.Config.ARGB_8888).also { target ->
+                    val canvas = android.graphics.Canvas(target)
+                    val source = android.graphics.Rect(0, 0, bitmap.width, bitmap.height)
+                    val destination = android.graphics.Rect(0, 0, scaledWidth, scaledHeight)
+                    val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+                    canvas.drawBitmap(bitmap, source, destination, paint)
+                }
+            }
+            val extractedWords = mutableListOf<Pair<Int, Word>>()
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            try {
+                val primaryTransform = RecognitionTransform(
+                    recognitionScaleX = 1f,
+                    recognitionScaleY = 1f,
+                    border = 0f,
+                    processedOffsetX = 0f,
+                    processedOffsetY = 0f,
+                    processedScale = scaleFactor,
+                    sourceWidth = bitmap.width,
+                    sourceHeight = bitmap.height,
+                )
+                recognizeWords(
+                    api = api,
+                    image = processedBitmap,
+                    density = density,
+                    jobContext = jobContext,
+                    transform = primaryTransform,
+                    canonicalPolarity = false,
+                ).forEach { word -> extractedWords += 0 to word }
+
+                jobContext.ensureActive()
+                val processedPixels = IntArray(scaledWidth * scaledHeight)
+                processedBitmap.getPixels(
+                    processedPixels,
+                    0,
+                    scaledWidth,
+                    0,
+                    0,
+                    scaledWidth,
+                    scaledHeight,
+                )
+                val fallbackRegions = MixedPolarityRegions.detect(
+                    pixels = processedPixels,
+                    width = scaledWidth,
+                    height = scaledHeight,
+                    maxRegions = 2,
+                )
+
+                fallbackRegions.forEachIndexed { index, region ->
+                    jobContext.ensureActive()
+                    var baseBitmap: Bitmap? = null
+                    var fallbackBitmap: Bitmap? = null
+                    try {
+                        val canonical = MixedPolarityRegions.canonicalize(
+                            sourcePixels = processedPixels,
+                            sourceWidth = scaledWidth,
+                            sourceHeight = scaledHeight,
+                            region = region,
+                        )
+                        baseBitmap = Bitmap.createBitmap(
+                            canonical.pixels,
+                            canonical.width,
+                            canonical.height,
+                            Bitmap.Config.ARGB_8888,
+                        )
+                        val baseArea = canonical.width.toDouble() * canonical.height.toDouble()
+                        val scaleByArea = sqrt(2_500_000.0 / baseArea).toFloat()
+                        val scaleByDimension = 2_200f / maxOf(canonical.width, canonical.height)
+                        val requestedScale = minOf(1.75f, scaleByArea, scaleByDimension)
+                            .coerceAtLeast(0.85f)
+                        val targetWidth = (canonical.width * requestedScale).roundToInt()
+                            .coerceAtLeast(1)
+                        val targetHeight = (canonical.height * requestedScale).roundToInt()
+                            .coerceAtLeast(1)
+                        fallbackBitmap = if (
+                            targetWidth == canonical.width && targetHeight == canonical.height
+                        ) {
+                            checkNotNull(baseBitmap).also { baseBitmap = null }
+                        } else {
+                            Bitmap.createScaledBitmap(
+                                checkNotNull(baseBitmap),
+                                targetWidth,
+                                targetHeight,
+                                true,
+                            ).also {
+                                baseBitmap?.recycle()
+                                baseBitmap = null
+                            }
+                        }
+
+                        val fallbackTransform = RecognitionTransform(
+                            recognitionScaleX = fallbackBitmap.width.toFloat() / canonical.width,
+                            recognitionScaleY = fallbackBitmap.height.toFloat() / canonical.height,
+                            border = canonical.border.toFloat(),
+                            processedOffsetX = region.left.toFloat(),
+                            processedOffsetY = region.top.toFloat(),
+                            processedScale = scaleFactor,
+                            sourceWidth = bitmap.width,
+                            sourceHeight = bitmap.height,
+                        )
+                        recognizeWords(
+                            api = api,
+                            image = fallbackBitmap,
+                            density = density,
+                            jobContext = jobContext,
+                            transform = fallbackTransform,
+                            canonicalPolarity = true,
+                        ).forEach { word -> extractedWords += (index + 1) to word }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        Log.w(TAG, "Mixed-polarity OCR fallback failed for $region", error)
+                    } finally {
+                        baseBitmap?.takeUnless { it.isRecycled }?.recycle()
+                        fallbackBitmap?.takeUnless { it.isRecycled }?.recycle()
+                    }
+                }
+
+                Log.d(
+                    TAG,
+                    "OCR completed in ${android.os.SystemClock.elapsedRealtime() - startedAt} ms; " +
+                        "fallbackRegions=${fallbackRegions.size}",
+                )
+            } finally {
+                try {
+                    api.clear()
+                } finally {
+                    if (processedBitmap !== bitmap && !processedBitmap.isRecycled) {
+                        processedBitmap.recycle()
+                    }
+                }
+            }
+            cachedWordsBitmap = WeakReference(bitmap)
+            cachedWordsLanguage = lang
+            cachedWords = extractedWords.toList()
+            cachedWords.orEmpty()
+        }
         
         // Final Merge & Line Grouping
         val textNodes = groupWordsIntoNodes(allWordsWithSource, screenWidth, density)
+
+        // Await parallel QR results
+        val qrCodes = qrDeferred?.await().orEmpty()
 
         // Native Smart Links extraction via regex
         val smartEntities = mutableListOf<SmartEntity>()
@@ -434,8 +721,8 @@ object TesseractEngine {
         if (allWordsWithSource.isEmpty()) return emptyList()
 
         // 1. Spatial Deduplication
-        // We prefer results from quadrants (indices 1-4) over the full pass (index 0) 
-        // because zoomed-in crops generally yield higher accuracy for small text.
+        // Prefer canonical mixed-polarity region results (indices > 0) over the
+        // standard full-screen pass when their word boxes overlap.
         val uniqueWords = mutableListOf<Word>()
         val sortedByPreference = allWordsWithSource.sortedWith(compareByDescending<Pair<Int, Word>> { it.first }.thenBy { it.second.bounds.width() * it.second.bounds.height() })
         

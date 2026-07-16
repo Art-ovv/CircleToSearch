@@ -31,8 +31,9 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.*
 import com.akslabs.circletosearch.ocr.TesseractEngine
-import java.io.File
-import java.io.FileOutputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -40,11 +41,18 @@ import java.util.Locale
 fun OcrSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val prefs = context.getSharedPreferences("OcrSettings", Context.MODE_PRIVATE)
+    val scope = rememberCoroutineScope()
 
     var currentLang by remember { mutableStateOf(prefs.getString("selected_lang", "eng") ?: "eng") }
-    var availableModels by remember { mutableStateOf(TesseractEngine.getAvailableModels(context)) }
+    var availableModels by remember { mutableStateOf<List<String>>(emptyList()) }
     var isNoteVisible by remember { mutableStateOf(prefs.getBoolean("ocr_note_dismissed", false).not()) }
     val uriHandler = LocalUriHandler.current
+
+    LaunchedEffect(context.applicationContext) {
+        availableModels = withContext(Dispatchers.IO) {
+            TesseractEngine.getAvailableModels(context.applicationContext)
+        }
+    }
 
     androidx.activity.compose.BackHandler(onBack = onBack)
 
@@ -52,10 +60,13 @@ fun OcrSettingsScreen(onBack: () -> Unit) {
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            TesseractEngine.importModel(context, uri) { success, msg ->
-                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                if (success) {
-                    availableModels = TesseractEngine.getAvailableModels(context)
+            scope.launch {
+                val result = TesseractEngine.importModel(context, uri)
+                Toast.makeText(context, result.message, Toast.LENGTH_SHORT).show()
+                if (result.success) {
+                    availableModels = withContext(Dispatchers.IO) {
+                        TesseractEngine.getAvailableModels(context.applicationContext)
+                    }
                 }
             }
         }
