@@ -1,22 +1,37 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Built artifacts and Gradle
+build/
+.gradle/
+.kotlin/
+
+# Local configuration file (sdk path, etc)
 local.properties
-C:\Users\ashin\AndroidStudioProjects\CircleToSearch\builderors.md
-C:\Users\ashin\AndroidStudioProjects\CircleToSearch\logs.md
-# Android build outputs
+/local.properties
+
+# Log Files
+*.log
+/builderors.md
+/logs.md
+
+# Android Studio Local Config/Cache/Caches
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/shelf/
+.idea/locks/
+.idea/copilot/
+*.iml
+
+# OS/System files
+.DS_Store
+
+# Android build outputs and signatures
 *.apk
 *.aab
 *.dm
 /app/release/
+*.jks
+*.keystore
+google-services.json
