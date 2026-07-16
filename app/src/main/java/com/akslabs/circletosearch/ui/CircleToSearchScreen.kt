@@ -20,6 +20,7 @@
 package com.akslabs.circletosearch.ui
 
 import android.graphics.Bitmap
+import android.graphics.BlurMaskFilter
 import android.graphics.Rect
 import com.akslabs.circletosearch.CircleToSearchAccessibilityService
 import com.akslabs.circletosearch.ui.components.SmartEntity
@@ -34,6 +35,9 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -88,11 +92,11 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.TextFields
@@ -120,12 +124,15 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
@@ -133,22 +140,35 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.collect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect as ComposeRect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PaintingStyle
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -157,8 +177,10 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebSettingsCompat
+import com.akslabs.circletosearch.data.AssistDataRepository
 import com.akslabs.circletosearch.data.SearchEngine
 import com.akslabs.circletosearch.ui.components.searchWithGoogleLens
+import com.akslabs.circletosearch.ui.components.mergeTextNodes
 import com.akslabs.circletosearch.ui.theme.OverlayGradientColors
 import com.akslabs.circletosearch.utils.ImageSearchUploader
 import com.akslabs.circletosearch.utils.ImageUtils
@@ -168,11 +190,17 @@ import com.akslabs.circletosearch.utils.QrScanner
 import com.akslabs.circletosearch.ui.qrResultShortLabel
 import com.akslabs.circletosearch.utils.UIPreferences
 import android.net.Uri
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.lastOrNull
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.tasks.await
 import androidx.webkit.WebViewFeature
 import com.akslabs.circletosearch.data.isDirectUpload
@@ -191,6 +219,7 @@ fun CircleToSearchScreen(
     screenshot: Bitmap?,
     onClose: () -> Unit,
     searchModeOverride: Boolean? = null,
+    assistToken: String? = null,
     copyTextManager: com.akslabs.circletosearch.ui.components.CopyTextOverlayManager? = null,
     onCopyText: () -> Unit = {},
     onExitCopyMode: () -> Unit = {},
@@ -264,16 +293,59 @@ fun CircleToSearchScreen(
     var activeHandle by remember { mutableStateOf<String?>(null) } // "tl", "tr", "bl", "br"
     
     // QR Scanner state
-    var showQrSheet by remember { mutableStateOf(false) }
-    var qrScanBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
-    var detectedQrCodes by remember { mutableStateOf<List<QrResultWithBounds>>(emptyList()) }
-    var selectedQrResult by remember { mutableStateOf<QrResultWithBounds?>(null) }
-    var isScanningQr by remember { mutableStateOf(false) }
+    var showQrSheet by remember(screenshot) { mutableStateOf(false) }
+    var qrScanBitmap by remember(screenshot) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var detectedQrCodes by remember(screenshot) { mutableStateOf<List<QrResultWithBounds>>(emptyList()) }
+    var selectedQrResult by remember(screenshot) { mutableStateOf<QrResultWithBounds?>(null) }
+    var isAnalyzingText by remember(screenshot) { mutableStateOf(false) }
     
     var isCopyMode by remember { mutableStateOf(false) }
-    var detectedEntities by remember { mutableStateOf<List<SmartEntity>>(emptyList()) }
-    val textNodes = remember { androidx.compose.runtime.mutableStateListOf<com.akslabs.circletosearch.ui.components.TextNode>() }
+    var detectedTextEntities by remember(screenshot) { mutableStateOf<List<SmartEntity>>(emptyList()) }
+    var ocrTextNodes by remember(screenshot) {
+        mutableStateOf<List<com.akslabs.circletosearch.ui.components.TextNode>>(emptyList())
+    }
+    val assistSnapshot by AssistDataRepository.snapshot.collectAsState()
+    val scanGeneration = remember { AtomicLong(0L) }
     var showTranslationLangDialog by remember { mutableStateOf(false) }
+    val detectedEntities = remember(detectedTextEntities, detectedQrCodes) {
+        detectedTextEntities + detectedQrCodes.mapNotNull { qr ->
+            qr.bounds?.let { bounds -> SmartEntity.QrCode(qr.result, qr.rawText, bounds) }
+        }
+    }
+
+    val matchingAssistSnapshot = remember(assistSnapshot, assistToken) {
+        assistSnapshot.takeIf { snapshot ->
+            assistToken != null && snapshot.token == assistToken && snapshot.ready
+        }
+    }
+    val mergedTextNodes = remember(ocrTextNodes, matchingAssistSnapshot, screenshot) {
+        val source = screenshot
+        if (source == null) {
+            emptyList()
+        } else {
+            mergeTextNodes(
+                assistNodes = matchingAssistSnapshot?.nodes.orEmpty(),
+                ocrNodes = ocrTextNodes,
+                bitmapWidth = source.width,
+                bitmapHeight = source.height,
+                assistCoordinateWidth = matchingAssistSnapshot?.coordinateWidth ?: source.width,
+                assistCoordinateHeight = matchingAssistSnapshot?.coordinateHeight ?: source.height,
+            )
+        }
+    }
+    var hasPresentedScanResults by remember(screenshot) { mutableStateOf(false) }
+    val hasUsableScanResults = mergedTextNodes.isNotEmpty() || detectedEntities.isNotEmpty()
+    LaunchedEffect(screenshot, hasUsableScanResults) {
+        if (hasUsableScanResults) {
+            // Accessibility nodes can make selection interactive before the
+            // slower OCR enrichment pass returns. Once results are usable, do
+            // not restart scanning feedback for this screenshot.
+            hasPresentedScanResults = true
+        }
+    }
+    LaunchedEffect(copyTextManager, mergedTextNodes) {
+        copyTextManager?.updateNodes(mergedTextNodes)
+    }
     
 
 
@@ -396,6 +468,63 @@ fun CircleToSearchScreen(
     var isSearching by remember { mutableStateOf(false) }
     var selectionRect by remember { mutableStateOf<Rect?>(null) }
     val selectionAnim = remember { androidx.compose.animation.core.Animatable(0f) }
+    val renderDensity = androidx.compose.ui.platform.LocalDensity.current
+
+    // Drawing resources are retained across frames. Gesture callbacks mutate the
+    // trail path; the Canvas only consumes it and never allocates a Path/Paint/Brush.
+    val selectionTrailPath = remember { Path() }
+    val selectionTrailBrush = remember {
+        Brush.linearGradient(
+            colors = OverlayGradientColors + OverlayGradientColors.first(),
+        )
+    }
+    val selectionTrailCoreStroke = remember(renderDensity) {
+        Stroke(
+            width = with(renderDensity) { 7.dp.toPx() },
+            cap = StrokeCap.Round,
+            join = StrokeJoin.Round,
+        )
+    }
+    val selectionTrailHighlightStroke = remember(renderDensity) {
+        Stroke(
+            width = with(renderDensity) { 2.dp.toPx() },
+            cap = StrokeCap.Round,
+            join = StrokeJoin.Round,
+        )
+    }
+    val selectionTrailGlowPaint = remember(renderDensity) {
+        androidx.compose.ui.graphics.Paint().apply {
+            color = Color(0xFF8AB4F8)
+            alpha = 0.78f
+            isAntiAlias = true
+            style = PaintingStyle.Stroke
+            strokeWidth = with(renderDensity) { 15.dp.toPx() }
+            strokeCap = StrokeCap.Round
+            strokeJoin = StrokeJoin.Round
+            asFrameworkPaint().maskFilter = BlurMaskFilter(
+                with(renderDensity) { 9.dp.toPx() },
+                BlurMaskFilter.Blur.NORMAL,
+            )
+        }
+    }
+    val selectionBracketPaths = remember(selectionRect) {
+        createSelectionBracketPaths(selectionRect)
+    }
+    val selectionBracketStroke = remember(renderDensity) {
+        Stroke(
+            width = with(renderDensity) { 4.dp.toPx() },
+            cap = StrokeCap.Round,
+            join = StrokeJoin.Round,
+        )
+    }
+    val selectionFlashStroke = remember(renderDensity) {
+        Stroke(width = with(renderDensity) { 1.5.dp.toPx() })
+    }
+    val tintOverlayBrush = remember {
+        Brush.verticalGradient(
+            colors = OverlayGradientColors.map { it.copy(alpha = 0.15f) },
+        )
+    }
     
     // Lifecycle reset: When screenshot changes, reset selection and modes
     LaunchedEffect(screenshot) {
@@ -404,6 +533,7 @@ fun CircleToSearchScreen(
             selectedBitmap = null
             isSearching = false
             currentPathPoints.clear()
+            selectionTrailPath.reset()
             selectionAnim.snapTo(0f)
         }
     }
@@ -419,22 +549,64 @@ fun CircleToSearchScreen(
     )
 
     // Auto-scan entire screenshot for text, QR codes, links, and entities
+    // Runs on background dispatcher so the screenshot displays instantly
+    // while OCR works in parallel. User can already draw circles during scan.
     LaunchedEffect(screenshot) {
-        if (screenshot != null) {
-            isScanningQr = true
+        val generation = scanGeneration.incrementAndGet()
+        val source = screenshot
+        if (source != null) {
+            isAnalyzingText = true
+            detectedQrCodes = emptyList()
+            detectedTextEntities = emptyList()
+            ocrTextNodes = emptyList()
+            val qrDeferred = async(Dispatchers.Default) {
+                try {
+                    QrScanner.scanBitmapAll(source).lastOrNull().orEmpty()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    // A QR decoder failure must not cancel the sibling OCR job.
+                    android.util.Log.e("CircleToSearch", "QR scan failed", error)
+                    emptyList()
+                }
+            }
             try {
-                val extractionResult = com.akslabs.circletosearch.ocr.TesseractEngine.extractText(context, screenshot!!)
-                textNodes.clear()
-                textNodes.addAll(extractionResult.textNodes)
-                detectedEntities = extractionResult.smartEntities
+                val extractionResult = com.akslabs.circletosearch.ocr.TesseractEngine.extractText(
+                    context.applicationContext,
+                    source,
+                    includeQrCodes = false,
+                )
+                currentCoroutineContext().ensureActive()
+                if (scanGeneration.get() != generation) return@LaunchedEffect
+
+                ocrTextNodes = extractionResult.textNodes
+                detectedTextEntities = extractionResult.smartEntities
+            } catch (error: CancellationException) {
+                throw error
+            } catch (e: Exception) {
+                android.util.Log.e("CircleToSearch", "OCR scan failed", e)
             } finally {
-                isScanningQr = false
+                // Direct state writes are safe during coroutine cancellation. The
+                // generation guard prevents an old scan from hiding a newer one.
+                if (scanGeneration.get() == generation) {
+                    isAnalyzingText = false
+                }
+            }
+
+            try {
+                val qrCodes = qrDeferred.await()
+                currentCoroutineContext().ensureActive()
+                if (scanGeneration.get() == generation) detectedQrCodes = qrCodes
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                android.util.Log.e("CircleToSearch", "QR scan failed", error)
             }
         } else {
             detectedQrCodes = emptyList()
-            detectedEntities = emptyList()
-            textNodes.clear()
-            isScanningQr = false
+            detectedTextEntities = emptyList()
+            ocrTextNodes = emptyList()
+            isAnalyzingText = false
         }
     }
 
@@ -522,13 +694,27 @@ fun CircleToSearchScreen(
     }
 
     // Back Handler Logic
+    LaunchedEffect(scaffoldState.bottomSheetState) {
+        var sheetWasVisible =
+            scaffoldState.bottomSheetState.currentValue != androidx.compose.material3.SheetValue.Hidden
+        snapshotFlow { scaffoldState.bottomSheetState.currentValue }.collect { sheetValue ->
+            if (sheetValue == androidx.compose.material3.SheetValue.Hidden && sheetWasVisible) {
+                isSearching = false
+                isLoading = false
+            }
+            sheetWasVisible = sheetValue != androidx.compose.material3.SheetValue.Hidden
+        }
+    }
+
     BackHandler(enabled = true) {
+        val sheetValue = scaffoldState.bottomSheetState.currentValue
         val currentWebView = webViews[selectedEngine]
-        if (currentWebView != null && currentWebView.canGoBack()) {
+        if (sheetValue != androidx.compose.material3.SheetValue.Hidden && currentWebView?.canGoBack() == true) {
             currentWebView.goBack()
-        } else if (scaffoldState.bottomSheetState.currentValue == androidx.compose.material3.SheetValue.Expanded) {
+        } else if (sheetValue == androidx.compose.material3.SheetValue.Expanded) {
              scope.launch { scaffoldState.bottomSheetState.partialExpand() }
-        } else if (scaffoldState.bottomSheetState.currentValue == androidx.compose.material3.SheetValue.PartiallyExpanded) {
+        } else if (sheetValue == androidx.compose.material3.SheetValue.PartiallyExpanded) {
+             isSearching = false
              scope.launch { scaffoldState.bottomSheetState.hide() }
         } else {
             onClose()
@@ -606,6 +792,7 @@ fun CircleToSearchScreen(
 
                 // Reset everything when bitmap changes (new area selected)
                 LaunchedEffect(selectedBitmap) {
+                    isSearching = false
                     hostedImageUrl = null
                     searchUrl = null
                     preloadedUrls.clear()
@@ -622,8 +809,11 @@ fun CircleToSearchScreen(
                     webViews.clear()
                 }
 
-                LaunchedEffect(selectedBitmap, hostedImageUrl) {
-                    if (selectedBitmap != null) {
+                LaunchedEffect(selectedBitmap, isSearching) {
+                    val searchBitmap = selectedBitmap
+                    if (!isSearching || searchBitmap == null) {
+                        isLoading = false
+                    } else {
                         isLoading = true
                         
                         val effectiveLensOnly = searchModeOverride ?: isGoogleLensOnly
@@ -633,19 +823,32 @@ fun CircleToSearchScreen(
                         // get the value that was last committed, even from another activity.
                         if (effectiveLensOnly) {
                             // Save to cache and launch Lens
-                            val path = ImageUtils.saveBitmap(context, selectedBitmap!!)
+                            val path = try {
+                                withContext(Dispatchers.IO) {
+                                    ImageUtils.saveBitmap(context, searchBitmap)
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                android.util.Log.e("CircleToSearch", "Could not prepare Lens image", error)
+                                isLoading = false
+                                isSearching = false
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Could not prepare image search",
+                                    android.widget.Toast.LENGTH_SHORT,
+                                ).show()
+                                return@LaunchedEffect
+                            }
                             val uri = android.net.Uri.fromFile(java.io.File(path))
                             
                             val result = searchWithGoogleLens(uri, context)
                             when (result) {
                                 com.akslabs.circletosearch.ui.components.LensLaunchResult.LAUNCHED_DIRECTLY -> {
-                                    // Lens launched directly — safe to dismiss the overlay
-                                    onClose()
-                                    return@LaunchedEffect
-                                }
-                                com.akslabs.circletosearch.ui.components.LensLaunchResult.LAUNCHED_VIA_CHOOSER -> {
-                                    // Chooser shown — overlay must stay open, user picks the app
+                                    // Keep the overlay alive behind Lens so its granted cache URI
+                                    // cannot be deleted before the receiving app opens the image.
                                     isLoading = false
+                                    isSearching = false
                                     return@LaunchedEffect
                                 }
                                 com.akslabs.circletosearch.ui.components.LensLaunchResult.FAILED -> {
@@ -656,27 +859,32 @@ fun CircleToSearchScreen(
                         }
 
                         // 2. Multi-Search Mode (Expanded UI)
-                        scope.launch { scaffoldState.bottomSheetState.expand() }
+                        launch { scaffoldState.bottomSheetState.expand() }
 
                         // 3. Upload to host if needed (Multi-Search Mode)
-                        if (hostedImageUrl == null) {
-                            val url = ImageSearchUploader.uploadToImageHost(selectedBitmap!!)
-                            if (url != null) {
-                                hostedImageUrl = url
-                            } else {
-                                isLoading = false
-                                return@LaunchedEffect
-                            }
+                        val imageUrl = hostedImageUrl ?: ImageSearchUploader
+                            .uploadToImageHost(searchBitmap)
+                            ?.also { hostedImageUrl = it }
+                        if (imageUrl == null) {
+                            isLoading = false
+                            isSearching = false
+                            android.widget.Toast.makeText(
+                                context,
+                                "Could not start image search",
+                                android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                            return@LaunchedEffect
                         }
 
                         // 2. Generate URLs for ALL engines (lightweight string op)
                         searchEngines.forEach { engine ->
                             if (!preloadedUrls.containsKey(engine)) {
                                 val url = when (engine) {
-                                    SearchEngine.Google -> ImageSearchUploader.getGoogleLensUrl(hostedImageUrl!!)
-                                    SearchEngine.Bing -> ImageSearchUploader.getBingUrl(hostedImageUrl!!)
-                                    SearchEngine.Yandex -> ImageSearchUploader.getYandexUrl(hostedImageUrl!!)
-                                    SearchEngine.TinEye -> ImageSearchUploader.getTinEyeUrl(hostedImageUrl!!)
+                                    // Use the web-friendly Google image search URL in the in-app tab.
+                                    SearchEngine.Google -> ImageSearchUploader.getGoogleImagesUrl(imageUrl)
+                                    SearchEngine.Bing -> ImageSearchUploader.getBingUrl(imageUrl)
+                                    SearchEngine.Yandex -> ImageSearchUploader.getYandexUrl(imageUrl)
+                                    SearchEngine.TinEye -> ImageSearchUploader.getTinEyeUrl(imageUrl)
                                     else -> null
                                 }
                                 if (url != null) preloadedUrls[engine] = url
@@ -697,7 +905,7 @@ fun CircleToSearchScreen(
                         isLoading = false
                         
                         // Then, load others sequentially
-                        scope.launch {
+                        launch {
                             searchEngines.forEach { engine ->
                                 if (engine != selectedEngine) {
                                     delay(300) // Reduced from 800ms for faster loading
@@ -876,9 +1084,7 @@ fun CircleToSearchScreen(
                         // 1. Draw global dim
                         drawRect(Color.Black.copy(alpha = dimAlpha))
                         drawRect(
-                            brush = Brush.verticalGradient(
-                                colors = OverlayGradientColors.map { it.copy(alpha = dimAlpha) }
-                            )
+                            brush = tintOverlayBrush,
                         )
                         
                         // 2. Clear selection area if it exists
@@ -963,6 +1169,8 @@ fun CircleToSearchScreen(
                                     // Clear previous state if starting new draw
                                     currentPathPoints.clear()
                                     currentPathPoints.add(offset)
+                                    selectionTrailPath.reset()
+                                    selectionTrailPath.moveTo(offset.x, offset.y)
                                     selectionRect = null
                                     scope.launch { selectionAnim.snapTo(0f) }
                                 },
@@ -983,9 +1191,12 @@ fun CircleToSearchScreen(
                                         }
                                     } else {
                                         currentPathPoints.add(change.position)
+                                        selectionTrailPath.lineTo(change.position.x, change.position.y)
                                     }
                                 },
                                 onDragCancel = {
+                                    currentPathPoints.clear()
+                                    selectionTrailPath.reset()
                                     isUIVisible = true
                                 },
                                 onDragEnd = {
@@ -1025,35 +1236,31 @@ fun CircleToSearchScreen(
                                             }
                                             scope.launch {
                                                 selectionAnim.animateTo(1f, tween(600))
-                                                isSearching = true
                                             }
                                         }
                                     }
+                                    currentPathPoints.clear()
+                                    selectionTrailPath.reset()
                                 }
                             )
                         }
                 ) {
                     // Draw current path (Real-time)
                     if (currentPathPoints.size > 1) {
-                        val path = Path().apply {
-                            moveTo(currentPathPoints.first().x, currentPathPoints.first().y)
-                            for (i in 1 until currentPathPoints.size) {
-                                lineTo(currentPathPoints[i].x, currentPathPoints[i].y)
-                            }
-                        }
-                        
-                        // Glow
+                        // BlurMaskFilter lives on a retained Paint, producing a soft
+                        // neon halo without allocating render objects per frame.
+                        drawContext.canvas.drawPath(selectionTrailPath, selectionTrailGlowPaint)
                         drawPath(
-                            path = path,
-                            brush = Brush.linearGradient(OverlayGradientColors),
-                            style = Stroke(width = 30f, cap = StrokeCap.Round, join = StrokeJoin.Round),
-                            alpha = 0.6f
+                            path = selectionTrailPath,
+                            brush = selectionTrailBrush,
+                            style = selectionTrailCoreStroke,
+                            alpha = 0.96f,
                         )
-                        // Core
                         drawPath(
-                            path = path,
+                            path = selectionTrailPath,
                             color = Color.White,
-                            style = Stroke(width = 12f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                            style = selectionTrailHighlightStroke,
+                            alpha = 0.88f,
                         )
                     }
 
@@ -1068,75 +1275,23 @@ fun CircleToSearchScreen(
                         
                         val width = right - left
                         val height = bottom - top
-                        val cornerRadius = 48f // Slightly smaller radius
-                        val armLength = min(width, height) * 0.15f // Slightly shorter arms
-
-                        // Top Left
-                        val tlPath = Path().apply {
-                            moveTo(left, top + armLength)
-                            lineTo(left, top + cornerRadius)
-                            arcTo(
-                                rect = androidx.compose.ui.geometry.Rect(left, top, left + 2 * cornerRadius, top + 2 * cornerRadius),
-                                startAngleDegrees = 180f,
-                                sweepAngleDegrees = 90f,
-                                forceMoveTo = false
+                        selectionBracketPaths.forEach { bracketPath ->
+                            drawPath(
+                                bracketPath,
+                                Color.White,
+                                style = selectionBracketStroke,
+                                alpha = progress,
                             )
-                            lineTo(left + armLength, top)
-                        }
-                        // Top Right
-                        val trPath = Path().apply {
-                            moveTo(right - armLength, top)
-                            lineTo(right - cornerRadius, top)
-                            arcTo(
-                                rect = androidx.compose.ui.geometry.Rect(right - 2 * cornerRadius, top, right, top + 2 * cornerRadius),
-                                startAngleDegrees = 270f,
-                                sweepAngleDegrees = 90f,
-                                forceMoveTo = false
-                            )
-                            lineTo(right, top + armLength)
-                        }
-                        // Bottom Right
-                        val brPath = Path().apply {
-                            moveTo(right, bottom - armLength)
-                            lineTo(right, bottom - cornerRadius)
-                            arcTo(
-                                rect = androidx.compose.ui.geometry.Rect(right - 2 * cornerRadius, bottom - 2 * cornerRadius, right, bottom),
-                                startAngleDegrees = 0f,
-                                sweepAngleDegrees = 90f,
-                                forceMoveTo = false
-                            )
-                            lineTo(right - armLength, bottom)
-                        }
-                        // Bottom Left
-                        val blPath = Path().apply {
-                            moveTo(left + armLength, bottom)
-                            lineTo(left + cornerRadius, bottom)
-                            arcTo(
-                                rect = androidx.compose.ui.geometry.Rect(left, bottom - 2 * cornerRadius, left + 2 * cornerRadius, bottom),
-                                startAngleDegrees = 90f,
-                                sweepAngleDegrees = 90f,
-                                forceMoveTo = false
-                            )
-                            lineTo(left, bottom - armLength)
                         }
 
-                        val bracketAlpha = progress
-                        val bracketStroke = Stroke(width = 12f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                        
-                        // Draw Brackets (Solid White)
-                        listOf(tlPath, trPath, brPath, blPath).forEach { p ->
-                            drawPath(p, Color.White, style = bracketStroke, alpha = bracketAlpha)
-                        }
-                        
-                        // Optional: Flash effect inside
-                         drawRoundRect(
+                        drawRoundRect(
                             color = Color.White,
                             topLeft = Offset(left, top),
                             size = Size(width, height),
                             cornerRadius = CornerRadius(48f),
-                            style = Stroke(width = 4f),
-                            alpha = (1f - progress) * 0.5f
-                         )
+                            style = selectionFlashStroke,
+                            alpha = (1f - progress) * 0.5f,
+                        )
                     }
                 }
 
@@ -1438,13 +1593,27 @@ fun CircleToSearchScreen(
                                     IconButton(
                                         onClick = {
                                             haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                            if (screenshot != null) {
-                                                // Trigger Lens directly as this is the explicit Lens button
-                                                // but do NOT change the global preference.
-                                                val path = ImageUtils.saveBitmap(context, screenshot)
-                                                val uri = android.net.Uri.fromFile(java.io.File(path))
-                                                searchWithGoogleLens(uri, context)
-                                                onClose()
+                                            val bitmap = screenshot ?: return@IconButton
+                                            scope.launch {
+                                                try {
+                                                    val path = withContext(Dispatchers.IO) {
+                                                        ImageUtils.saveBitmap(context, bitmap)
+                                                    }
+                                                    val uri = android.net.Uri.fromFile(java.io.File(path))
+                                                    val lensResult = searchWithGoogleLens(uri, context)
+                                                    if (lensResult == com.akslabs.circletosearch.ui.components.LensLaunchResult.FAILED) {
+                                                        isSearching = true
+                                                    }
+                                                } catch (error: CancellationException) {
+                                                    throw error
+                                                } catch (error: Exception) {
+                                                    android.util.Log.e("CircleToSearch", "Lens launch failed", error)
+                                                    android.widget.Toast.makeText(
+                                                        context,
+                                                        "Could not open image search",
+                                                        android.widget.Toast.LENGTH_SHORT,
+                                                    ).show()
+                                                }
                                             }
                                         },
                                         modifier = Modifier.size(44.dp)
@@ -1535,20 +1704,22 @@ fun CircleToSearchScreen(
 
             // Seamless Text Selection Overlay integration (Active when in copy mode)
             if (copyTextManager != null) {
-                AndroidView(
-                    factory = { ctx ->
-                        copyTextManager.getOverlayView(onDismiss = {
-                            onExitCopyMode()
-                        })
-                    },
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .zIndex(150f)
-                )
+                key(copyTextManager) {
+                    AndroidView(
+                        factory = {
+                            copyTextManager.getOverlayView(onDismiss = {
+                                onExitCopyMode()
+                            })
+                        },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(150f),
+                    )
+                }
             }
 
-            // 4. Selection Actions (Share) — Positioned at the very end for absolute top-layer rendering
-            if (selectionRect != null && selectionAnim.value == 1f) {
+            // 4. Selection actions — positioned last so they render above the crop overlay.
+            if (selectionRect != null && selectionAnim.value == 1f && !isSearching) {
                 val rect = selectionRect!!
                 val density = androidx.compose.ui.platform.LocalDensity.current
                 val leftPx = rect.left.toFloat()
@@ -1560,109 +1731,149 @@ fun CircleToSearchScreen(
                 val topDp = with(density) { topPx.toDp() }
                 val rightDp = with(density) { rightPx.toDp() }
                 val bottomDp = with(density) { bottomPx.toDp() }
-                val widthDp = rightDp - leftDp
                 
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(2000f) // Highest Z-index
+                        .zIndex(2000f)
                 ) {
                     val screenWidth = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp
                     val screenHeight = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
                     val centerX = (leftDp + rightDp) / 2
+                    val actionBarWidth = minOf(360.dp, (screenWidth - 16.dp).coerceAtLeast(280.dp))
+                    val maximumX = (screenWidth - actionBarWidth - 8.dp).coerceAtLeast(8.dp)
                     Box(
                         modifier = Modifier
                             .offset(
-                                x = (centerX - 125.dp).coerceIn(0.dp, screenWidth - 250.dp),
+                                x = (centerX - actionBarWidth / 2).coerceIn(8.dp, maximumX),
                                 y = if (topPx > 200f) (topDp - 72.dp).coerceAtLeast(16.dp) else (bottomDp + 16.dp).coerceAtMost(screenHeight - 80.dp)
                             )
-                            .width(250.dp),
+                            .width(actionBarWidth),
                         contentAlignment = Alignment.Center
                     ) {
-                        // Wrapped in Surface to match Bottom Bar tonal environment
                         androidx.compose.material3.Surface(
                             color = MaterialTheme.colorScheme.surfaceContainerHigh,
                             shape = CircleShape,
                             tonalElevation = 4.dp,
                             shadowElevation = 8.dp
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                // 1. SHARE BUTTON
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
                                 androidx.compose.material3.FilledTonalButton(
                                     onClick = {
-                                        if (selectedBitmap != null) {
-                                            scope.launch {
-                                                try {
+                                        val bitmap = selectedBitmap
+                                        if (bitmap != null) scope.launch {
+                                            try {
+                                                val path = withContext(Dispatchers.IO) {
                                                     val fileName = "selection_${java.util.UUID.randomUUID()}.png"
-                                                    val path = ImageUtils.saveBitmap(context, selectedBitmap!!, fileName)
-                                                    val file = java.io.File(path)
-                                                    val uri = androidx.core.content.FileProvider.getUriForFile(context, "com.akslabs.circletosearch.fileprovider", file)
-                                                    val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply { 
-                                                        type = "image/png"
-                                                        putExtra(android.content.Intent.EXTRA_STREAM, uri)
-                                                        clipData = android.content.ClipData.newRawUri("Selection", uri)
-                                                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                    }
-                                                    context.startActivity(android.content.Intent.createChooser(shareIntent, "Share Selection").apply { 
-                                                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) 
-                                                    })
-                                                } catch (e: Exception) {
-                                                    android.util.Log.e("CircleToSearch", "Failed to share selection", e)
+                                                    ImageUtils.saveBitmap(context, bitmap, fileName)
                                                 }
+                                                val file = java.io.File(path)
+                                                val uri = androidx.core.content.FileProvider.getUriForFile(
+                                                    context,
+                                                    "${context.packageName}.fileprovider",
+                                                    file,
+                                                )
+                                                val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                                    type = "image/png"
+                                                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                                    clipData = android.content.ClipData.newRawUri("Selection", uri)
+                                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                }
+                                                context.startActivity(
+                                                    android.content.Intent.createChooser(shareIntent, "Share selection")
+                                                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                                                )
+                                            } catch (e: Exception) {
+                                                android.util.Log.e("CircleToSearch", "Failed to share selection", e)
+                                                android.widget.Toast.makeText(
+                                                    context,
+                                                    "Could not share selection",
+                                                    android.widget.Toast.LENGTH_SHORT,
+                                                ).show()
                                             }
                                         }
                                     },
-                                    modifier = Modifier.height(48.dp),
-                                    shape = CircleShape,
-                                    colors = androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
-                                        containerColor = Color.Transparent, // Parent surface handles color
-                                        contentColor = MaterialTheme.colorScheme.onSurface
-                                    ),
-                                    elevation = null,
-                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp)
-                                ) {
-                                    Text(
-                                        "Share", 
-                                        style = MaterialTheme.typography.labelLarge.copy(
-                                            fontWeight = androidx.compose.ui.text.font.FontWeight.Normal
-                                        )
-                                    )
-                                }
-
-                                // Separator
-                                androidx.compose.material3.VerticalDivider(
-                                    modifier = Modifier.height(24.dp).padding(horizontal = 2.dp),
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                                )
-
-                                // 2. SAVE BUTTON
-                                androidx.compose.material3.FilledTonalButton(
-                                    onClick = {
-                                        if (selectedBitmap != null) {
-                                            val success = ImageUtils.saveToGallery(context, selectedBitmap!!)
-                                            if (success) {
-                                                haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                                android.widget.Toast.makeText(context, "Saved to Gallery", android.widget.Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                android.widget.Toast.makeText(context, "Failed to save", android.widget.Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-                                    },
-                                    modifier = Modifier.height(48.dp),
+                                    modifier = Modifier.weight(1f).height(48.dp),
                                     shape = CircleShape,
                                     colors = androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
                                         containerColor = Color.Transparent,
                                         contentColor = MaterialTheme.colorScheme.onSurface
                                     ),
                                     elevation = null,
-                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp)
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp)
                                 ) {
+                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Share", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                                }
+
+                                androidx.compose.material3.VerticalDivider(
+                                    modifier = Modifier.height(24.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                                )
+
+                                androidx.compose.material3.FilledTonalButton(
+                                    onClick = {
+                                        val bitmap = selectedBitmap
+                                        if (bitmap != null) scope.launch {
+                                            val success = withContext(Dispatchers.IO) {
+                                                ImageUtils.saveToGallery(context.applicationContext, bitmap)
+                                            }
+                                            if (success) {
+                                                haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                            }
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                if (success) "Saved to Gallery" else "Could not save selection",
+                                                android.widget.Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f).height(48.dp),
+                                    shape = CircleShape,
+                                    colors = androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = Color.Transparent,
+                                        contentColor = MaterialTheme.colorScheme.onSurface,
+                                    ),
+                                    elevation = null,
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp),
+                                ) {
+                                    Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Save", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                                }
+
+                                androidx.compose.material3.VerticalDivider(
+                                    modifier = Modifier.height(24.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                                )
+
+                                androidx.compose.material3.FilledTonalButton(
+                                    onClick = {
+                                        if (selectedBitmap != null) {
+                                            haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                            isSearching = true
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f).height(48.dp),
+                                    shape = CircleShape,
+                                    colors = androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = Color.Transparent,
+                                        contentColor = MaterialTheme.colorScheme.onSurface,
+                                    ),
+                                    elevation = null,
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp),
+                                ) {
+                                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
                                     Text(
-                                        "Save", 
-                                        style = MaterialTheme.typography.labelLarge.copy(
-                                            fontWeight = androidx.compose.ui.text.font.FontWeight.Normal
-                                        )
+                                        "Search",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Clip,
                                     )
                                 }
                             }
@@ -1671,40 +1882,94 @@ fun CircleToSearchScreen(
                 }
             }
 
-        // --- Unified Google-Style Scanning Indicator ---
-        val isAnalyzingScreen = isScanningQr
-        
+        // Intersecting corner-to-corner aurora waves communicate background analysis.
+        // The delay prevents flicker on warm scans.
+        val isAnalysisFeedbackActive = isAnalyzingText && !hasPresentedScanResults
+        var analysisDelayElapsed by remember { mutableStateOf(false) }
+        LaunchedEffect(isAnalysisFeedbackActive) {
+            analysisDelayElapsed = false
+            if (isAnalysisFeedbackActive) {
+                delay(140)
+                analysisDelayElapsed = true
+            }
+        }
         androidx.compose.animation.AnimatedVisibility(
-            visible = isAnalyzingScreen,
-            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { 50 }),
-            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { 50 }),
-            modifier = Modifier.fillMaxSize().padding(bottom = 120.dp).zIndex(3500f)
+            visible = isAnalysisFeedbackActive && analysisDelayElapsed,
+            enter = androidx.compose.animation.fadeIn(tween(220)),
+            exit = androidx.compose.animation.fadeOut(tween(280)),
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(3500f),
         ) {
-            Box(contentAlignment = Alignment.BottomCenter) {
-                Surface(
-                    shape = RoundedCornerShape(24.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    tonalElevation = 8.dp,
-                    shadowElevation = 12.dp
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        androidx.compose.material3.CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.5.dp,
-                            color = Color(0xFF4285F4) // Google Blue
-                        )
-                        Spacer(Modifier.width(16.dp))
-                        val text = "Analyzing screen..."
-                        androidx.compose.material3.Text(
-                            text = text, 
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
+            val analysisTransition = rememberInfiniteTransition(label = "screen analysis")
+            val primaryFlow = analysisTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(
+                        durationMillis = 4_400,
+                        easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                    ),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "primary light field",
+            )
+            val secondaryFlow = analysisTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(
+                        durationMillis = 3_250,
+                        easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                    ),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "secondary light field",
+            )
+            val tertiaryFlow = analysisTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(
+                        durationMillis = 5_100,
+                        easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                    ),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "tertiary light field",
+            )
+            val sheenFlow = analysisTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(
+                        durationMillis = 2_750,
+                        easing = androidx.compose.animation.core.FastOutSlowInEasing,
+                    ),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "white sheen",
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .scanningEdgeGlow(
+                        primaryFlow = primaryFlow,
+                        secondaryFlow = secondaryFlow,
+                        tertiaryFlow = tertiaryFlow,
+                        sheenFlow = sheenFlow,
+                    ),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .size(1.dp)
+                        .semantics {
+                            contentDescription = "Screen analysis in progress"
+                            liveRegion = LiveRegionMode.Polite
+                            progressBarRangeInfo = ProgressBarRangeInfo.Indeterminate
+                        },
+                )
             }
         }
 
@@ -1904,6 +2169,229 @@ fun CircleToSearchScreen(
     }
 }
 }
+}
+
+private fun DrawScope.drawSoftLightField(
+    center: Offset,
+    brush: Brush,
+    radius: Float,
+    scaleX: Float,
+    scaleY: Float,
+    alpha: Float,
+    blendMode: BlendMode = BlendMode.SrcOver,
+) {
+    translate(left = center.x, top = center.y) {
+        scale(scaleX = scaleX, scaleY = scaleY, pivot = Offset.Zero) {
+            drawCircle(
+                brush = brush,
+                radius = radius,
+                center = Offset.Zero,
+                alpha = alpha,
+                blendMode = blendMode,
+            )
+        }
+    }
+}
+
+private fun Modifier.scanningEdgeGlow(
+    primaryFlow: State<Float>,
+    secondaryFlow: State<Float>,
+    tertiaryFlow: State<Float>,
+    sheenFlow: State<Float>,
+): Modifier = drawWithCache {
+    val fieldRadius = max(size.width, size.height) * 0.72f
+    val blue = Color(0xFF4285F4)
+    val red = Color(0xFFEA4335)
+    val yellow = Color(0xFFFBBC05)
+    val green = Color(0xFF34A853)
+    val blueField = Brush.radialGradient(
+        0f to blue.copy(alpha = 0.52f),
+        0.42f to blue.copy(alpha = 0.25f),
+        0.78f to blue.copy(alpha = 0.07f),
+        1f to Color.Transparent,
+        center = Offset.Zero,
+        radius = fieldRadius,
+    )
+    val redField = Brush.radialGradient(
+        0f to red.copy(alpha = 0.58f),
+        0.40f to red.copy(alpha = 0.30f),
+        0.78f to red.copy(alpha = 0.08f),
+        1f to Color.Transparent,
+        center = Offset.Zero,
+        radius = fieldRadius,
+    )
+    val yellowField = Brush.radialGradient(
+        0f to yellow.copy(alpha = 0.46f),
+        0.43f to yellow.copy(alpha = 0.22f),
+        0.80f to yellow.copy(alpha = 0.06f),
+        1f to Color.Transparent,
+        center = Offset.Zero,
+        radius = fieldRadius,
+    )
+    val greenField = Brush.radialGradient(
+        0f to green.copy(alpha = 0.48f),
+        0.42f to green.copy(alpha = 0.23f),
+        0.80f to green.copy(alpha = 0.06f),
+        1f to Color.Transparent,
+        center = Offset.Zero,
+        radius = fieldRadius,
+    )
+    val whiteSheen = Brush.radialGradient(
+        0f to Color.White.copy(alpha = 0.62f),
+        0.38f to Color.White.copy(alpha = 0.25f),
+        0.76f to Color.White.copy(alpha = 0.06f),
+        1f to Color.Transparent,
+        center = Offset.Zero,
+        radius = fieldRadius,
+    )
+
+    onDrawBehind {
+        val primary = primaryFlow.value
+        val secondary = secondaryFlow.value
+        val tertiary = tertiaryFlow.value
+        val sheen = sheenFlow.value
+        val width = size.width
+        val height = size.height
+
+        // The reference uses a translucent frosted veil beneath broad moving
+        // color fields, not discrete particles or a narrow scan band.
+        drawRect(Color.White, alpha = 0.055f + sheen * 0.035f)
+
+        drawSoftLightField(
+            center = Offset(
+                x = width * (-0.12f + secondary * 0.62f),
+                y = height * (-0.04f + primary * 0.38f),
+            ),
+            brush = blueField,
+            radius = fieldRadius,
+            scaleX = 0.78f + tertiary * 0.16f,
+            scaleY = 0.62f + secondary * 0.12f,
+            alpha = 0.34f,
+        )
+        drawSoftLightField(
+            center = Offset(
+                x = width * (0.02f + tertiary * 0.62f),
+                y = height * (0.16f + secondary * 0.52f),
+            ),
+            brush = greenField,
+            radius = fieldRadius,
+            scaleX = 0.80f + primary * 0.14f,
+            scaleY = 0.68f + tertiary * 0.13f,
+            alpha = 0.36f,
+        )
+        drawSoftLightField(
+            center = Offset(
+                x = width * (0.28f + primary * 0.62f),
+                y = height * (0.78f - tertiary * 0.36f),
+            ),
+            brush = yellowField,
+            radius = fieldRadius,
+            scaleX = 0.82f + secondary * 0.17f,
+            scaleY = 0.63f + primary * 0.11f,
+            alpha = 0.30f,
+        )
+        drawSoftLightField(
+            center = Offset(
+                x = width * (0.06f + primary * 1.02f),
+                y = height * (0.82f - secondary * 0.56f),
+            ),
+            brush = redField,
+            radius = fieldRadius,
+            scaleX = 0.98f + tertiary * 0.20f,
+            scaleY = 0.72f + primary * 0.15f,
+            alpha = 0.43f,
+        )
+
+        // A second, offset red layer creates the soft rolling pink wave visible
+        // across the middle and lower half of the reference animation.
+        drawSoftLightField(
+            center = Offset(
+                x = width * (0.86f - tertiary * 0.54f),
+                y = height * (0.42f + primary * 0.34f),
+            ),
+            brush = redField,
+            radius = fieldRadius,
+            scaleX = 0.72f + secondary * 0.15f,
+            scaleY = 0.58f + tertiary * 0.10f,
+            alpha = 0.21f,
+        )
+        drawSoftLightField(
+            center = Offset(
+                x = width * (0.18f + sheen * 0.74f),
+                y = height * (0.30f + (1f - sheen) * 0.45f),
+            ),
+            brush = whiteSheen,
+            radius = fieldRadius,
+            scaleX = 0.78f + tertiary * 0.22f,
+            scaleY = 0.64f + secondary * 0.14f,
+            alpha = 0.31f,
+            blendMode = BlendMode.Screen,
+        )
+    }
+}
+
+private fun createSelectionBracketPaths(rect: Rect?): List<Path> {
+    if (rect == null || rect.width() <= 0 || rect.height() <= 0) return emptyList()
+    val left = rect.left.toFloat()
+    val top = rect.top.toFloat()
+    val right = rect.right.toFloat()
+    val bottom = rect.bottom.toFloat()
+    val minimumDimension = min(right - left, bottom - top)
+    val cornerRadius = min(48f, minimumDimension * 0.25f)
+    val armLength = (minimumDimension * 0.18f)
+        .coerceAtLeast(cornerRadius)
+        .coerceAtMost(minimumDimension * 0.45f)
+
+    val topLeft = Path().apply {
+        moveTo(left, top + armLength)
+        lineTo(left, top + cornerRadius)
+        arcTo(
+            rect = ComposeRect(left, top, left + 2 * cornerRadius, top + 2 * cornerRadius),
+            startAngleDegrees = 180f,
+            sweepAngleDegrees = 90f,
+            forceMoveTo = false,
+        )
+        lineTo(left + armLength, top)
+    }
+    val topRight = Path().apply {
+        moveTo(right - armLength, top)
+        lineTo(right - cornerRadius, top)
+        arcTo(
+            rect = ComposeRect(right - 2 * cornerRadius, top, right, top + 2 * cornerRadius),
+            startAngleDegrees = 270f,
+            sweepAngleDegrees = 90f,
+            forceMoveTo = false,
+        )
+        lineTo(right, top + armLength)
+    }
+    val bottomRight = Path().apply {
+        moveTo(right, bottom - armLength)
+        lineTo(right, bottom - cornerRadius)
+        arcTo(
+            rect = ComposeRect(
+                right - 2 * cornerRadius,
+                bottom - 2 * cornerRadius,
+                right,
+                bottom,
+            ),
+            startAngleDegrees = 0f,
+            sweepAngleDegrees = 90f,
+            forceMoveTo = false,
+        )
+        lineTo(right - armLength, bottom)
+    }
+    val bottomLeft = Path().apply {
+        moveTo(left + armLength, bottom)
+        lineTo(left + cornerRadius, bottom)
+        arcTo(
+            rect = ComposeRect(left, bottom - 2 * cornerRadius, left + 2 * cornerRadius, bottom),
+            startAngleDegrees = 90f,
+            sweepAngleDegrees = 90f,
+            forceMoveTo = false,
+        )
+        lineTo(left, bottom - armLength)
+    }
+    return listOf(topLeft, topRight, bottomRight, bottomLeft)
 }
 
 
