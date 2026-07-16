@@ -18,6 +18,7 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 
@@ -50,28 +51,28 @@ class ScreenTranslator : Closeable {
                 throw IllegalStateException("Failed to create bitmap copy")
             }
 
-            val canvas = Canvas(resultBitmap)
+            try {
+                val canvas = Canvas(resultBitmap)
+                val backgroundPaint = Paint().apply { style = Paint.Style.FILL }
+                val textPaint = TextPaint().apply { isAntiAlias = true }
+                val textBlocks = recognizeTextWithBounds(screenshot)
+                val translatedBlocks = translateBlocks(textBlocks, targetLangCode)
 
-            val backgroundPaint = Paint().apply { style = Paint.Style.FILL }
-            val textPaint = TextPaint().apply {
-                isAntiAlias = true
+                for (block in translatedBlocks) {
+                    val dominantBgColor = getDominantEdgeColor(screenshot, block.boundingBox)
+                    backgroundPaint.color = dominantBgColor
+
+                    val bgRect = Rect(block.boundingBox).apply { inset(-2, -2) }
+                    canvas.drawRect(bgRect, backgroundPaint)
+
+                    textPaint.color = getContrastColor(dominantBgColor)
+                    drawMultilineTextToFit(canvas, block.translatedText, block.boundingBox, textPaint)
+                }
+                resultBitmap
+            } catch (error: Throwable) {
+                resultBitmap.takeUnless { it.isRecycled }?.recycle()
+                throw error
             }
-
-            val textBlocks = recognizeTextWithBounds(screenshot)
-
-            val translatedBlocks = translateBlocks(textBlocks, targetLangCode)
-
-            for (block in translatedBlocks) {
-                val dominantBgColor = getDominantEdgeColor(screenshot, block.boundingBox)
-                backgroundPaint.color = dominantBgColor
-                
-                val bgRect = Rect(block.boundingBox).apply { inset(-2, -2) }
-                canvas.drawRect(bgRect, backgroundPaint)
-
-                textPaint.color = getContrastColor(dominantBgColor)
-                drawMultilineTextToFit(canvas, block.translatedText, block.boundingBox, textPaint)
-            }
-            resultBitmap
         }
     }
 
@@ -132,6 +133,8 @@ class ScreenTranslator : Closeable {
                 // Edge case: GrapheneOS / offline mode — model not downloaded
                 try {
                     translator.downloadModelIfNeeded().await()
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (e: Exception) {
                     android.util.Log.w(TAG, "Translation model unavailable: $sourceLang -> $targetLanguage. Skipping block.")
                     continue
@@ -143,6 +146,8 @@ class ScreenTranslator : Closeable {
                 if (translatedText.isNotBlank() && translatedText != block.text) {
                     translatedList.add(TranslatedBlockData(translatedText, block.boundingBox))
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "Error translating block: '${block.text.take(50)}...'", e)
             }

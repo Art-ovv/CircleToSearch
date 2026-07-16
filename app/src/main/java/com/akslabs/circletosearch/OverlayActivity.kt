@@ -35,9 +35,10 @@ import com.akslabs.circletosearch.utils.UIPreferences
 import com.akslabs.circletosearch.ui.components.CopyTextOverlayManager
 import com.akslabs.circletosearch.ui.theme.CircleToSearchTheme
 import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import android.widget.Toast
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.background
@@ -58,10 +59,16 @@ import androidx.compose.ui.Alignment
 
 class OverlayActivity : ComponentActivity() {
 
+    companion object {
+        const val EXTRA_ASSIST_TOKEN = "EXTRA_ASSIST_TOKEN"
+    }
+
     private val copyTextManager = androidx.compose.runtime.mutableStateOf<CopyTextOverlayManager?>(null)
     private val searchModeOverride = androidx.compose.runtime.mutableStateOf<Boolean?>(null)
+    private val assistToken = androidx.compose.runtime.mutableStateOf<String?>(null)
     private val isTranslating = androidx.compose.runtime.mutableStateOf(false)
     private val screenshotBitmap = androidx.compose.runtime.mutableStateOf<android.graphics.Bitmap?>(null)
+    private var translationJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0))
@@ -72,16 +79,13 @@ class OverlayActivity : ComponentActivity() {
         // Ensure the activity can receive touches and focus properly
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN)
-        
+
+        updateAssistToken(intent)
         loadScreenshot()
         updateOverride(intent)
 
         // Initialize manager for Activity-based layout
-        copyTextManager.value = CopyTextOverlayManager(
-            context = this,
-            screenshotBitmap = screenshotBitmap.value
-        )
-        CircleToSearchAccessibilityService.setCopyTextManager(copyTextManager.value)
+        replaceCopyTextManager(screenshotBitmap.value)
 
         setContent {
             CircleToSearchTheme {
@@ -94,14 +98,18 @@ class OverlayActivity : ComponentActivity() {
                         CircleToSearchScreen(
                             screenshot = screenshotBitmap.value,
                             searchModeOverride = searchModeOverride.value,
+                            assistToken = assistToken.value,
                             onClose = { 
-                                BitmapRepository.clear()
-                                com.akslabs.circletosearch.data.AssistDataRepository.clear()
+                                screenshotBitmap.value?.let(BitmapRepository::clearIfSame)
+                                assistToken.value?.let(
+                                    com.akslabs.circletosearch.data.AssistDataRepository::clear,
+                                )
                                 finish() 
                             },
                             copyTextManager = copyTextManager.value,
                             onExitCopyMode = { 
-                                // Copy Mode exited
+                                CircleToSearchAccessibilityService.setCopyTextManager(null)
+                                copyTextManager.value = null
                             },
                             onTranslate = { 
                                 val targetLang = UIPreferences(this@OverlayActivity).getTargetTranslateLang()
@@ -135,22 +143,23 @@ class OverlayActivity : ComponentActivity() {
         super.onNewIntent(intent)
         android.util.Log.d("CircleToSearch", "OverlayActivity onNewIntent - Resetting state")
         setIntent(intent)
+
+        translationJob?.cancel()
+        translationJob = null
+        isTranslating.value = false
         
         // IMMEDIATE NULLING to prevent flash of previous screen
         screenshotBitmap.value = null
         copyTextManager.value?.dismiss()
         copyTextManager.value = null
         searchModeOverride.value = null
-        
+
+        updateAssistToken(intent)
         loadScreenshot()
         updateOverride(intent)
 
         // Recreate manager with new screenshot
-        copyTextManager.value = CopyTextOverlayManager(
-            context = this,
-            screenshotBitmap = screenshotBitmap.value
-        )
-        CircleToSearchAccessibilityService.setCopyTextManager(copyTextManager.value)
+        replaceCopyTextManager(screenshotBitmap.value)
     }
 
     private fun updateOverride(intent: android.content.Intent) {
@@ -172,27 +181,47 @@ class OverlayActivity : ComponentActivity() {
         if (isTranslating.value) return
         isTranslating.value = true
 
-        lifecycleScope.launch(Dispatchers.Default) {
+        translationJob = lifecycleScope.launch {
+            var translatedBitmap: android.graphics.Bitmap? = null
             try {
-                val translatedBitmap = ScreenTranslator().use { translator ->
+                translatedBitmap = ScreenTranslator().use { translator ->
                     translator.translateScreen(currentBitmap, targetLangCode)
                 }
-                withContext(Dispatchers.Main) {
-                    val oldBitmap = screenshotBitmap.value
-                    screenshotBitmap.value = translatedBitmap
-                    BitmapRepository.setScreenshot(translatedBitmap)
-                    isTranslating.value = false
 
-                    // Recycle old bitmap (original screenshot) after translation
-                    if (oldBitmap != null && !oldBitmap.isRecycled && oldBitmap != translatedBitmap) {
-                        oldBitmap.recycle()
-                    }
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("OverlayActivity", "Translation failed", e)
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@OverlayActivity, e.message ?: "Translation failed", Toast.LENGTH_LONG).show()
+                if (!isActive || screenshotBitmap.value !== currentBitmap || isFinishing || isDestroyed) {
+                    translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
+                    translatedBitmap = null
                     isTranslating.value = false
+                    return@launch
+                }
+
+                val completedBitmap = checkNotNull(translatedBitmap)
+                if (!BitmapRepository.compareAndSetScreenshot(currentBitmap, completedBitmap)) {
+                    completedBitmap.takeUnless { it.isRecycled }?.recycle()
+                    translatedBitmap = null
+                    isTranslating.value = false
+                    return@launch
+                }
+
+                assistToken.value?.let(
+                    com.akslabs.circletosearch.data.AssistDataRepository::clear,
+                )
+                assistToken.value = null
+                screenshotBitmap.value = completedBitmap
+                replaceCopyTextManager(completedBitmap)
+                translatedBitmap = null
+                isTranslating.value = false
+            } catch (error: CancellationException) {
+                translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
+                throw error
+            } catch (e: Exception) {
+                translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
+                android.util.Log.e("OverlayActivity", "Translation failed", e)
+                Toast.makeText(this@OverlayActivity, e.message ?: "Translation failed", Toast.LENGTH_LONG).show()
+                isTranslating.value = false
+            } finally {
+                if (translationJob === coroutineContext[Job]) {
+                    translationJob = null
                 }
             }
         }
@@ -207,8 +236,29 @@ class OverlayActivity : ComponentActivity() {
             android.util.Log.e("CircleToSearch", "No bitmap in Repository")
         }
     }
+
+    private fun updateAssistToken(intent: android.content.Intent) {
+        val previousToken = assistToken.value
+        val nextToken = intent.getStringExtra(EXTRA_ASSIST_TOKEN)
+        assistToken.value = nextToken
+        if (previousToken != null && previousToken != nextToken) {
+            com.akslabs.circletosearch.data.AssistDataRepository.clear(previousToken)
+        }
+    }
+
+    private fun replaceCopyTextManager(bitmap: android.graphics.Bitmap?) {
+        copyTextManager.value?.dismiss()
+        copyTextManager.value = CopyTextOverlayManager(
+            context = this,
+            screenshotBitmap = bitmap,
+        )
+        CircleToSearchAccessibilityService.setCopyTextManager(copyTextManager.value)
+    }
     
     override fun onDestroy() {
+        translationJob?.cancel()
+        translationJob = null
+        CircleToSearchAccessibilityService.setCopyTextManager(null)
         super.onDestroy()
         copyTextManager.value?.dismiss()
         copyTextManager.value = null
@@ -217,7 +267,9 @@ class OverlayActivity : ComponentActivity() {
         screenshotBitmap.value = null
 
         if (isFinishing) {
-             com.akslabs.circletosearch.data.AssistDataRepository.clear()
+             assistToken.value?.let(
+                 com.akslabs.circletosearch.data.AssistDataRepository::clear,
+             )
              com.akslabs.circletosearch.utils.StorageUtils.clearAppCache(this)
         }
     }

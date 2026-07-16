@@ -98,7 +98,7 @@
             android:exported="false"
             android:theme="@style/Theme.CircleToSearch.Transparent"
             android:excludeFromRecents="true"
-            android:launchMode="singleInstance" />
+            android:launchMode="singleTask" />
 
         <activity
             android:name=".TileTriggerActivity"
