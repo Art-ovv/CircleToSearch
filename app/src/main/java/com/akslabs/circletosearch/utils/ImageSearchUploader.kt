@@ -21,10 +21,15 @@ package com.akslabs.circletosearch.utils
 
 import android.graphics.Bitmap
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.io.InterruptedIOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -33,41 +38,83 @@ import java.util.UUID
 object ImageSearchUploader {
     private const val TAG = "ImageSearchUploader"
     private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    private const val TIMEOUT = 30000
+    private const val TIMEOUT = 15000
 
     /**
-     * Uploads the bitmap to Litterbox (1-hour temporary storage) with Catbox as fallback.
-     * Litterbox is used for privacy as images auto-delete after 1 hour.
+     * Uploads the bitmap to Litterbox temporary storage first. If that host
+     * times out or fails, Catbox is used as a practical fallback so search can
+     * still proceed.
      */
     suspend fun uploadToImageHost(bitmap: Bitmap): String? = withContext(Dispatchers.IO) {
+        val imageBytes = try {
+            encodeForUpload(bitmap)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Unable to encode image for search", error)
+            return@withContext null
+        }
+        currentCoroutineContext().ensureActive()
+
         // Try Litterbox first (temporary, privacy-focused)
-        val litterboxUrl = uploadToLitterbox(bitmap)
+        val litterboxUrl = try {
+            runInterruptible(Dispatchers.IO) { uploadToLitterbox(imageBytes) }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Temporary image upload was interrupted", error)
+            null
+        }
+        currentCoroutineContext().ensureActive()
         if (litterboxUrl != null) {
             Log.d(TAG, "Successfully uploaded to Litterbox (1h expiration)")
             return@withContext litterboxUrl
         }
-        
-        // Fallback to Catbox if Litterbox fails
-        Log.w(TAG, "Litterbox failed, falling back to Catbox")
-        val catboxUrl = uploadToCatbox(bitmap)
+
+        Log.w(TAG, "Temporary image upload failed, trying Catbox fallback")
+
+        val catboxUrl = try {
+            runInterruptible(Dispatchers.IO) { uploadToCatbox(imageBytes) }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Catbox fallback upload was interrupted", error)
+            null
+        }
+        currentCoroutineContext().ensureActive()
         if (catboxUrl != null) {
-            Log.d(TAG, "Successfully uploaded to Catbox (fallback)")
+            Log.d(TAG, "Successfully uploaded to Catbox fallback")
             return@withContext catboxUrl
         }
-        
-        Log.e(TAG, "Both Litterbox and Catbox uploads failed")
+
+        Log.e(TAG, "All image upload attempts failed")
         null
     }
     
     /**
-     * Uploads to Litterbox.catbox.moe with 1-hour expiration for privacy
+     * Compresses and resizes the bitmap into a JPEG payload suitable for upload.
      */
-    private suspend fun uploadToLitterbox(bitmap: Bitmap): String? = withContext(Dispatchers.IO) {
-        try {
+    private fun encodeForUpload(bitmap: Bitmap): ByteArray {
+        val resized = ImageUtils.resizeBitmap(bitmap, 1280)
+        return try {
+            ByteArrayOutputStream().use { output ->
+                check(resized.compress(Bitmap.CompressFormat.JPEG, 90, output)) {
+                    "Bitmap encoder rejected the image"
+                }
+                output.toByteArray()
+            }
+        } finally {
+            if (resized !== bitmap && !resized.isRecycled) resized.recycle()
+        }
+    }
+
+    private fun uploadToLitterbox(imageBytes: ByteArray): String? {
+        var connection: HttpURLConnection? = null
+        return try {
             val boundary = "----WebKitFormBoundary" + UUID.randomUUID().toString().replace("-", "")
             val url = URL("https://litterbox.catbox.moe/resources/internals/api.php")
             
-            val connection = (url.openConnection() as HttpURLConnection).apply {
+            connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
                 doInput = true
@@ -77,12 +124,6 @@ object ImageSearchUploader {
                 setRequestProperty("User-Agent", USER_AGENT)
                 setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
             }
-            
-            // Resize and compress image
-            val resized = ImageUtils.resizeBitmap(bitmap, 1280)
-            val outputStream = ByteArrayOutputStream()
-            resized.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
-            val imageBytes = outputStream.toByteArray()
             
             Log.d(TAG, "Uploading to Litterbox: ${imageBytes.size} bytes")
             
@@ -110,28 +151,34 @@ object ImageSearchUploader {
             
             val responseCode = connection.responseCode
             if (responseCode == 200) {
-                val imageUrl = connection.inputStream.bufferedReader().use { it.readText() }
+                val imageUrl = connection.inputStream.bufferedReader().use { it.readText().trim() }
                 Log.d(TAG, "Litterbox URL: $imageUrl (expires in 1h)")
-                imageUrl
+                imageUrl.ifBlank { null }
             } else {
                 Log.e(TAG, "Litterbox upload failed: $responseCode")
                 null
             }
+        } catch (error: InterruptedException) {
+            throw error
+        } catch (error: InterruptedIOException) {
+            throw error
+        } catch (error: CancellationException) {
+            throw error
         } catch (e: Exception) {
             Log.e(TAG, "Litterbox upload error", e)
             null
+        } finally {
+            connection?.disconnect()
         }
     }
-    
-    /**
-     * Fallback: Uploads to Catbox.moe (permanent storage)
-     */
-    private suspend fun uploadToCatbox(bitmap: Bitmap): String? = withContext(Dispatchers.IO) {
-        try {
+
+    private fun uploadToCatbox(imageBytes: ByteArray): String? {
+        var connection: HttpURLConnection? = null
+        return try {
             val boundary = "----WebKitFormBoundary" + UUID.randomUUID().toString().replace("-", "")
             val url = URL("https://catbox.moe/user/api.php")
-            
-            val connection = (url.openConnection() as HttpURLConnection).apply {
+
+            connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
                 doInput = true
@@ -141,44 +188,44 @@ object ImageSearchUploader {
                 setRequestProperty("User-Agent", USER_AGENT)
                 setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
             }
-            
-            // Resize and compress image
-            val resized = ImageUtils.resizeBitmap(bitmap, 1280)
-            val outputStream = ByteArrayOutputStream()
-            resized.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
-            val imageBytes = outputStream.toByteArray()
-            
-            Log.d(TAG, "Uploading to Catbox: ${imageBytes.size} bytes")
-            
+
+            Log.d(TAG, "Uploading to Catbox fallback: ${imageBytes.size} bytes")
+
             DataOutputStream(connection.outputStream).use { dos ->
-                // reqtype=fileupload
                 dos.writeBytes("--$boundary\r\n")
                 dos.writeBytes("Content-Disposition: form-data; name=\"reqtype\"\r\n\r\n")
                 dos.writeBytes("fileupload\r\n")
-                
-                // fileToUpload
+
                 dos.writeBytes("--$boundary\r\n")
                 dos.writeBytes("Content-Disposition: form-data; name=\"fileToUpload\"; filename=\"image.jpg\"\r\n")
                 dos.writeBytes("Content-Type: image/jpeg\r\n\r\n")
                 dos.write(imageBytes)
                 dos.writeBytes("\r\n")
-                
+
                 dos.writeBytes("--$boundary--\r\n")
                 dos.flush()
             }
-            
+
             val responseCode = connection.responseCode
             if (responseCode == 200) {
-                val imageUrl = connection.inputStream.bufferedReader().use { it.readText() }
+                val imageUrl = connection.inputStream.bufferedReader().use { it.readText().trim() }
                 Log.d(TAG, "Catbox URL: $imageUrl")
-                imageUrl
+                imageUrl.ifBlank { null }
             } else {
                 Log.e(TAG, "Catbox upload failed: $responseCode")
                 null
             }
+        } catch (error: InterruptedException) {
+            throw error
+        } catch (error: InterruptedIOException) {
+            throw error
+        } catch (error: CancellationException) {
+            throw error
         } catch (e: Exception) {
             Log.e(TAG, "Catbox upload error", e)
             null
+        } finally {
+            connection?.disconnect()
         }
     }
 

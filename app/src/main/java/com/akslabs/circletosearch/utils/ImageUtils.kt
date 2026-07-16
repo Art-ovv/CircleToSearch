@@ -31,8 +31,16 @@ object ImageUtils {
 
     fun saveBitmap(context: Context, bitmap: Bitmap, fileName: String = SCREENSHOT_FILENAME): String {
         val file = File(context.cacheDir, fileName)
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        try {
+            FileOutputStream(file).use { out ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                    "Bitmap encoder rejected the image"
+                }
+                out.fd.sync()
+            }
+        } catch (error: Throwable) {
+            file.delete()
+            throw error
         }
         return file.absolutePath
     }
@@ -68,6 +76,7 @@ object ImageUtils {
     }
 
     fun saveToGallery(context: Context, bitmap: Bitmap): Boolean {
+        var imageUri: android.net.Uri? = null
         try {
             val filename = "CircleSelection_${System.currentTimeMillis()}.png"
             val contentValues = android.content.ContentValues().apply {
@@ -80,24 +89,31 @@ object ImageUtils {
             }
 
             val contentResolver = context.contentResolver
-            val imageUri = contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            imageUri = contentResolver.insert(
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues,
+            )
             
             if (imageUri == null) return false
 
-            contentResolver.openOutputStream(imageUri).use { out ->
-                if (out != null) {
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                }
+            val wasWritten = contentResolver.openOutputStream(imageUri).use { out ->
+                out != null && bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
+            if (!wasWritten) throw java.io.IOException("Unable to write gallery image")
 
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                 contentValues.clear()
                 contentValues.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
-                contentResolver.update(imageUri, contentValues, null, null)
+                check(contentResolver.update(imageUri, contentValues, null, null) == 1) {
+                    "Unable to publish gallery image"
+                }
             }
             
             return true
         } catch (e: Exception) {
+            imageUri?.let { uri ->
+                runCatching { context.contentResolver.delete(uri, null, null) }
+            }
             android.util.Log.e("ImageUtils", "Failed to save to gallery", e)
             return false
         }

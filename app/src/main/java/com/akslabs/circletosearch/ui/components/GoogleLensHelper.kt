@@ -23,8 +23,6 @@ private const val TAG = "GoogleLensHelper"
 enum class LensLaunchResult {
     /** Launched directly into Google app / Gallery — overlay can be safely dismissed */
     LAUNCHED_DIRECTLY,
-    /** Showed system app chooser — overlay must stay open so user can pick */
-    LAUNCHED_VIA_CHOOSER,
     /** All approaches failed */
     FAILED
 }
@@ -54,7 +52,7 @@ fun searchWithGoogleLens(uri: Uri, context: Context): LensLaunchResult {
 
                 FileProvider.getUriForFile(
                     context,
-                    "com.akslabs.circletosearch.fileprovider",
+                    "${context.packageName}.fileprovider",
                     file
                 )
             } catch (e: Exception) {
@@ -142,24 +140,7 @@ fun searchWithGoogleLens(uri: Uri, context: Context): LensLaunchResult {
             Log.e(TAG, "Failed to launch Google app with ACTION_VIEW: ${e.message}")
         }
 
-        // Approach 5: System chooser fallback
-        try {
-            val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "image/*"
-                putExtra(Intent.EXTRA_STREAM, contentUri)
-                applyRobustPermissions(contentUri)
-            }
-            val chooser = Intent.createChooser(sendIntent, "Search with Google Lens")
-            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(chooser)
-            vibrateDevice(context)
-            Log.d(TAG, "Chooser launched")
-            return LensLaunchResult.LAUNCHED_VIA_CHOOSER
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch chooser: ${e.message}")
-        }
-
-        Toast.makeText(context, "Google Lens is not available on this device", Toast.LENGTH_SHORT).show()
+        Log.w(TAG, "No direct Google Lens target found for this device")
         return LensLaunchResult.FAILED
     } catch (e: Exception) {
         Log.e(TAG, "Error launching Google Lens", e)
@@ -191,5 +172,3 @@ private fun vibrateDevice(context: Context) {
         Log.e(TAG, "Error vibrating device", e)
     }
 }
-
-
