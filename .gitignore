@@ -7,21 +7,26 @@ build/
 local.properties
 /local.properties
 
-# Log Files
+# Logs and local diagnostics
 *.log
-/builderors.md
 /logs.md
 
-# Android Studio Local Config/Cache/Caches
-.idea/caches/
-.idea/libraries/
-.idea/modules.xml
-.idea/workspace.xml
-.idea/navEditor.xml
-.idea/assetWizardSettings.xml
-.idea/shelf/
-.idea/locks/
-.idea/copilot/
+# Local AI assistants and agent instructions
+AGENTS.md
+CLAUDE.md
+claude_instructions.md
+builderors.md
+.agents/
+.codex/
+.claude/
+.gemini/
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+
+# Android Studio local state
+.idea/
 *.iml
 
 # OS/System files
