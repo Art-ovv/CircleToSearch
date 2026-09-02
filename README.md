@@ -68,29 +68,7 @@ search and downloading on-device language models.
   user settings or downloaded OCR models.
 - Removed donation prompts and unrelated promotional UI from this fork.
 
-## Install on a phone
-
-### Install a published APK
-
-1. Open the fork's [Releases](https://github.com/Art-ovv/CircleToSearch/releases)
-   page and download the APK for your device. Pixel 8 and most modern phones use
-   `arm64-v8a`; older 32-bit ARM devices use `armeabi-v7a`.
-2. On the phone, allow APK installation for the browser or file manager that
-   opened the file, then install it.
-3. Launch CircleToSearch and follow its setup screen.
-4. In Android settings, choose CircleToSearch as the **Digital assistant app**.
-5. Enable the CircleToSearch Accessibility Service if you want screen capture,
-   the accessibility shortcut, or the assistant fallback path.
-6. Invoke it with the assistant gesture, the configured overlay gesture, or the
-   Quick Settings tile.
-
-Android will not install an APK over an existing build signed with a different
-certificate. If you are switching from an upstream/F-Droid/Play build to this
-fork, first export anything you need and uninstall the old package, or build the
-fork with the same signing key. Uninstalling removes that installation's app
-data and settings.
-
-### Build and install from source
+## Build and install from source
 
 Requirements:
 
@@ -99,17 +77,34 @@ Requirements:
 - Android platform tools (`adb`) for command-line installation
 
 ```bash
-git clone git@github.com:Art-ovv/CircleToSearch.git
+git clone https://github.com/Art-ovv/CircleToSearch.git
 cd CircleToSearch
 ./gradlew assembleDebug
+```
+
+The build produces two APKs:
+
+- `app/build/outputs/apk/debug/app-arm64-v8a-debug.apk` for Pixel 8 and most
+  modern Android phones.
+- `app/build/outputs/apk/debug/app-armeabi-v7a-debug.apk` for older 32-bit ARM
+  devices.
+
+To install the Pixel 8/64-bit build on a connected phone:
+
+```bash
 adb devices
 adb install -r app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
 ```
 
-Use `app-armeabi-v7a-debug.apk` instead on a 32-bit ARM device. The `-r` option
-updates an installation signed with the same key and preserves its app data.
-You can also open the project in Android Studio and run the `app` configuration
-on a connected device.
+The `-r` option updates an installation signed with the same key and preserves
+its app data. Android will reject an update signed with a different certificate;
+in that case the existing package must be uninstalled first, which also removes
+its app data and settings.
+
+After installation, launch CircleToSearch, enable its Accessibility Service,
+and select it as Android's **Digital assistant app**. You can then invoke it with
+the assistant gesture, the configured overlay gesture, or the Quick Settings
+tile.
 
 ## Development
 
