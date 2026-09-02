@@ -8,6 +8,7 @@ import android.graphics.Rect
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
+import android.util.Log
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
@@ -16,75 +17,203 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.io.Closeable
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "ScreenTranslator"
 
 data class TextBlockData(val text: String, val boundingBox: Rect)
 data class TranslatedBlockData(val translatedText: String, val boundingBox: Rect)
 
+enum class ScreenTranslationUnchangedReason {
+    NO_RECOGNIZED_TEXT,
+    NO_TRANSLATABLE_TEXT,
+}
+
+/**
+ * Result of translating a screen using already recognized text nodes.
+ *
+ * [Translated.bitmap] is a new mutable bitmap owned by the caller. [Unchanged] deliberately does
+ * not contain a bitmap, so an unchanged full-screen frame does not need to be copied.
+ */
+sealed interface ScreenTranslationOutcome {
+    data class Unchanged(
+        val reason: ScreenTranslationUnchangedReason,
+    ) : ScreenTranslationOutcome
+
+    data class Translated(
+        val bitmap: Bitmap,
+        val translatedBlockCount: Int,
+    ) : ScreenTranslationOutcome
+}
+
+/** Immutable, allocation-light OCR handoff prepared when overlay nodes change. */
+internal data class ScreenTranslationNode(
+    val text: String,
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int,
+)
+
 class ScreenTranslator : Closeable {
 
+    private data class TextBlockKey(
+        val text: String,
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+    )
+
     private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    
+
     private val languageIdentifier = LanguageIdentification.getClient()
 
-    private val translators = mutableMapOf<String, Translator>()
+    private val translators = mutableMapOf<TranslationLanguagePair, Translator>()
+    private val translatorLock = Any()
+    private val closed = AtomicBoolean(false)
+    private val translationPairSemaphore = Semaphore(permits = 2)
 
+    /**
+     * Compatibility entry point for capture flows that do not yet own recognized text nodes.
+     *
+     * It preserves the previous contract of always returning a distinct bitmap. New overlay code
+     * should call the overload accepting [textNodes], which avoids both duplicate OCR and an
+     * unnecessary bitmap copy when nothing changes.
+     */
     suspend fun translateScreen(screenshot: Bitmap, targetLangCode: String? = null): Bitmap {
-        return withContext(Dispatchers.Default) {
-            if (screenshot.isRecycled) {
-                throw IllegalStateException("Bitmap is already recycled.")
-            }
+        return when (
+            val outcome = translateScreen(
+                screenshot = screenshot,
+                textNodes = emptyList<ScreenTranslationNode>(),
+                targetLangCode = targetLangCode,
+            )
+        ) {
+            is ScreenTranslationOutcome.Translated -> outcome.bitmap
+            is ScreenTranslationOutcome.Unchanged -> copyForCompatibility(screenshot)
+        }
+    }
 
-            val resultBitmap = try {
-                screenshot.copy(Bitmap.Config.ARGB_8888, true)
-            } catch (e: OutOfMemoryError) {
-                throw IllegalStateException("Not enough memory to process screenshot", e)
-            }
+    /**
+     * Translates an existing OCR result, falling back to ML Kit text recognition only when the
+     * caller has no nodes at all. Passing non-empty nodes is therefore an explicit assertion that
+     * recognition has completed, even when every node is later rejected as invalid. The caller
+     * must retain [screenshot] without mutating or recycling it until this function returns.
+     */
+    internal suspend fun translateScreen(
+        screenshot: Bitmap,
+        textNodes: List<ScreenTranslationNode>,
+        targetLangCode: String? = null,
+    ): ScreenTranslationOutcome {
+        var undeliveredBitmap: Bitmap? = null
+        return try {
+            val outcome = withContext(Dispatchers.Default) {
+                checkOpen()
+                check(!screenshot.isRecycled) { "Bitmap is already recycled." }
 
-            if (resultBitmap == null) {
-                throw IllegalStateException("Failed to create bitmap copy")
-            }
-
-            try {
-                val canvas = Canvas(resultBitmap)
-                val backgroundPaint = Paint().apply { style = Paint.Style.FILL }
-                val textPaint = TextPaint().apply { isAntiAlias = true }
-                val textBlocks = recognizeTextWithBounds(screenshot)
-                val translatedBlocks = translateBlocks(textBlocks, targetLangCode)
-
-                for (block in translatedBlocks) {
-                    val dominantBgColor = getDominantEdgeColor(screenshot, block.boundingBox)
-                    backgroundPaint.color = dominantBgColor
-
-                    val bgRect = Rect(block.boundingBox).apply { inset(-2, -2) }
-                    canvas.drawRect(bgRect, backgroundPaint)
-
-                    textPaint.color = getContrastColor(dominantBgColor)
-                    drawMultilineTextToFit(canvas, block.translatedText, block.boundingBox, textPaint)
+                val textBlocks = if (textNodes.isEmpty()) {
+                    recognizeTextWithBounds(screenshot)
+                } else {
+                    textBlocksFromNodes(
+                        nodes = textNodes,
+                        bitmapWidth = screenshot.width,
+                        bitmapHeight = screenshot.height,
+                    )
                 }
-                resultBitmap
-            } catch (error: Throwable) {
-                resultBitmap.takeUnless { it.isRecycled }?.recycle()
-                throw error
+                if (textBlocks.isEmpty()) {
+                    return@withContext ScreenTranslationOutcome.Unchanged(
+                        ScreenTranslationUnchangedReason.NO_RECOGNIZED_TEXT,
+                    )
+                }
+
+                val translatedBlocks = translateBlocks(textBlocks, targetLangCode)
+                if (translatedBlocks.isEmpty()) {
+                    return@withContext ScreenTranslationOutcome.Unchanged(
+                        ScreenTranslationUnchangedReason.NO_TRANSLATABLE_TEXT,
+                    )
+                }
+
+                ScreenTranslationOutcome.Translated(
+                    bitmap = renderTranslations(
+                        screenshot = screenshot,
+                        translatedBlocks = translatedBlocks,
+                    ).also { undeliveredBitmap = it },
+                    translatedBlockCount = translatedBlocks.size,
+                )
             }
+            undeliveredBitmap = null
+            outcome
+        } finally {
+            // withContext has prompt cancellation: recycle a rendered bitmap if cancellation wins
+            // while the result is being dispatched back to the caller.
+            undeliveredBitmap?.takeUnless { it.isRecycled }?.recycle()
+        }
+    }
+
+    private suspend fun copyForCompatibility(screenshot: Bitmap): Bitmap {
+        var undeliveredBitmap: Bitmap? = null
+        return try {
+            val result = withContext(Dispatchers.Default) {
+                currentCoroutineContext().ensureActive()
+                copyMutableBitmap(screenshot).also { undeliveredBitmap = it }
+            }
+            undeliveredBitmap = null
+            result
+        } finally {
+            undeliveredBitmap?.takeUnless { it.isRecycled }?.recycle()
+        }
+    }
+
+    private fun textBlocksFromNodes(
+        nodes: List<ScreenTranslationNode>,
+        bitmapWidth: Int,
+        bitmapHeight: Int,
+    ): List<TextBlockData> {
+        if (bitmapWidth <= 0 || bitmapHeight <= 0) return emptyList()
+
+        val bitmapBounds = Rect(0, 0, bitmapWidth, bitmapHeight)
+        return nodes.mapNotNull { node ->
+            val text = node.text.trim()
+            if (text.isEmpty()) return@mapNotNull null
+
+            val clampedBounds = Rect(node.left, node.top, node.right, node.bottom)
+            if (!clampedBounds.intersect(bitmapBounds) || clampedBounds.isEmpty) {
+                return@mapNotNull null
+            }
+            TextBlockData(text = text, boundingBox = clampedBounds)
+        }.distinctBy { block ->
+            TextBlockKey(
+                text = block.text,
+                left = block.boundingBox.left,
+                top = block.boundingBox.top,
+                right = block.boundingBox.right,
+                bottom = block.boundingBox.bottom,
+            )
         }
     }
 
     private suspend fun recognizeTextWithBounds(bitmap: Bitmap): List<TextBlockData> {
         val image = InputImage.fromBitmap(bitmap, 0)
         val visionText = textRecognizer.process(image).await()
-        
+
         val resultList = mutableListOf<TextBlockData>()
         for (block in visionText.textBlocks) {
             val boundingBox = block.boundingBox ?: continue
             val originalText = block.text
-            
+
             if (originalText.isNotBlank()) {
                 resultList.add(TextBlockData(originalText, boundingBox))
             }
@@ -92,14 +221,16 @@ class ScreenTranslator : Closeable {
         return resultList
     }
 
-    private fun getTranslator(sourceLang: String, targetLang: String): Translator {
-        val key = "$sourceLang-$targetLang"
-        return translators.getOrPut(key) {
-            val options = TranslatorOptions.Builder()
-                .setSourceLanguage(sourceLang)
-                .setTargetLanguage(targetLang)
-                .build()
-            Translation.getClient(options)
+    private fun getTranslator(languagePair: TranslationLanguagePair): Translator {
+        return synchronized(translatorLock) {
+            checkOpen()
+            translators.getOrPut(languagePair) {
+                val options = TranslatorOptions.Builder()
+                    .setSourceLanguage(languagePair.sourceLanguage)
+                    .setTargetLanguage(languagePair.targetLanguage)
+                    .build()
+                Translation.getClient(options)
+            }
         }
     }
 
@@ -107,52 +238,203 @@ class ScreenTranslator : Closeable {
      * Translates recognized text blocks.
      * Edge cases: unidentified language, missing model, network errors.
      */
-    private suspend fun translateBlocks(blocks: List<TextBlockData>, targetLangCode: String?): List<TranslatedBlockData> {
-        val translatedList = mutableListOf<TranslatedBlockData>()
-        val langToUse = targetLangCode ?: java.util.Locale.getDefault().language
-        val targetLanguage = TranslateLanguage.fromLanguageTag(langToUse) ?: TranslateLanguage.ENGLISH
+    private suspend fun translateBlocks(
+        blocks: List<TextBlockData>,
+        targetLangCode: String?,
+    ): List<TranslatedBlockData> {
+        currentCoroutineContext().ensureActive()
 
-        for (block in blocks) {
+        val requestedTarget = targetLangCode ?: Locale.getDefault().language
+        val targetLanguage = TranslateLanguage.fromLanguageTag(requestedTarget)
+            ?: TranslateLanguage.ENGLISH
+        val aggregateLanguage = identifyAggregateLanguage(blocks)
+        val detectedLanguages = identifyBlockLanguages(blocks)
+        val groups = buildTranslationLanguageGroups(
+            blockTexts = blocks.map(TextBlockData::text),
+            detectedLanguageTags = detectedLanguages,
+            aggregateLanguage = aggregateLanguage,
+            targetLanguageTag = targetLanguage,
+        )
+        val supportedGroups = linkedMapOf<TranslationLanguagePair, MutableList<Int>>()
+        groups.forEach { (unvalidatedPair, blockIndexes) ->
+            val sourceLanguage = TranslateLanguage.fromLanguageTag(
+                unvalidatedPair.sourceLanguage,
+            ) ?: return@forEach
+            if (sourceLanguage == targetLanguage) return@forEach
+
+            val supportedPair = TranslationLanguagePair(
+                sourceLanguage = sourceLanguage,
+                targetLanguage = targetLanguage,
+            )
+            supportedGroups.getOrPut(supportedPair) { mutableListOf() }
+                .addAll(blockIndexes)
+        }
+
+        return coroutineScope {
+            supportedGroups.map { (supportedPair, blockIndexes) ->
+                async {
+                    translationPairSemaphore.withPermit {
+                        translateLanguageGroup(
+                            pair = supportedPair,
+                            blockIndexes = blockIndexes,
+                            blocks = blocks,
+                        )
+                    }
+                }
+            }.awaitAll()
+                .flatten()
+                .sortedBy(IndexedTranslatedBlock::index)
+                .map(IndexedTranslatedBlock::block)
+        }
+    }
+
+    private suspend fun identifyAggregateLanguage(
+        blocks: List<TextBlockData>,
+    ): AggregateLanguage? {
+        val sample = buildAggregateLanguageSample(blocks.map(TextBlockData::text))
+        if (sample.isEmpty()) return null
+
+        return try {
+            languageIdentifier.identifyPossibleLanguages(sample).await()
+                .asSequence()
+                .mapNotNull { language ->
+                    normalizeTranslationLanguageTag(language.languageTag)?.let { languageTag ->
+                        AggregateLanguage(
+                            languageTag = languageTag,
+                            confidence = language.confidence,
+                        )
+                    }
+                }
+                .maxByOrNull(AggregateLanguage::confidence)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            Log.w(TAG, "Aggregate language identification failed")
+            null
+        }
+    }
+
+    private suspend fun identifyBlockLanguages(
+        blocks: List<TextBlockData>,
+    ): List<String?> {
+        var failureCount = 0
+        val languages = blocks.map { block ->
             try {
-                val langCode = languageIdentifier.identifyLanguage(block.text).await()
-
-                // Edge case: language not identified ("und") — skip block
-                if (langCode == "und" || langCode.isNullOrEmpty()) {
-                    continue
-                }
-
-                val sourceLang = TranslateLanguage.fromLanguageTag(langCode)
-
-                // Edge case: language not supported by ML Kit — skip
-                if (sourceLang == null || sourceLang == targetLanguage) {
-                    continue
-                }
-
-                val translator = getTranslator(sourceLang, targetLanguage)
-
-                // Edge case: GrapheneOS / offline mode — model not downloaded
-                try {
-                    translator.downloadModelIfNeeded().await()
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "Translation model unavailable: $sourceLang -> $targetLanguage. Skipping block.")
-                    continue
-                }
-
-                val translatedText = translator.translate(block.text).await()
-
-                // Edge case: empty translation or translation matches original
-                if (translatedText.isNotBlank() && translatedText != block.text) {
-                    translatedList.add(TranslatedBlockData(translatedText, block.boundingBox))
-                }
+                languageIdentifier.identifyLanguage(
+                    buildBlockLanguageSample(block.text),
+                ).await()
             } catch (error: CancellationException) {
                 throw error
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "Error translating block: '${block.text.take(50)}...'", e)
+            } catch (_: Exception) {
+                failureCount += 1
+                null
             }
         }
-        return translatedList
+        if (failureCount > 0) {
+            Log.w(TAG, "Language identification failed for $failureCount text block(s)")
+        }
+        return languages
+    }
+
+    private data class IndexedTranslatedBlock(
+        val index: Int,
+        val block: TranslatedBlockData,
+    )
+
+    private suspend fun translateLanguageGroup(
+        pair: TranslationLanguagePair,
+        blockIndexes: List<Int>,
+        blocks: List<TextBlockData>,
+    ): List<IndexedTranslatedBlock> {
+        val coroutineContext = currentCoroutineContext()
+        val translator = getTranslator(pair)
+        try {
+            // Exactly one model check/download is issued for this source/target group.
+            translator.downloadModelIfNeeded().await()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            Log.w(
+                TAG,
+                "Translation model unavailable: ${pair.sourceLanguage} -> ${pair.targetLanguage}",
+            )
+            return emptyList()
+        }
+
+        var failureCount = 0
+        val translated = buildList {
+            for (index in blockIndexes) {
+                coroutineContext.ensureActive()
+                val block = blocks[index]
+                val translatedText = try {
+                    translator.translate(block.text).await()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    failureCount += 1
+                    continue
+                }
+
+                if (translatedText.isNotBlank() && translatedText != block.text) {
+                    add(
+                        IndexedTranslatedBlock(
+                            index = index,
+                            block = TranslatedBlockData(
+                                translatedText = translatedText,
+                                boundingBox = block.boundingBox,
+                            ),
+                        ),
+                    )
+                }
+            }
+        }
+        if (failureCount > 0) {
+            Log.w(
+                TAG,
+                "Translation failed for $failureCount block(s) in " +
+                    "${pair.sourceLanguage} -> ${pair.targetLanguage}",
+            )
+        }
+        return translated
+    }
+
+    private suspend fun renderTranslations(
+        screenshot: Bitmap,
+        translatedBlocks: List<TranslatedBlockData>,
+    ): Bitmap {
+        val coroutineContext = currentCoroutineContext()
+        coroutineContext.ensureActive()
+        val resultBitmap = copyMutableBitmap(screenshot)
+        try {
+            val canvas = Canvas(resultBitmap)
+            val backgroundPaint = Paint().apply { style = Paint.Style.FILL }
+            val textPaint = TextPaint().apply { isAntiAlias = true }
+
+            for (block in translatedBlocks) {
+                coroutineContext.ensureActive()
+                val dominantBgColor = getDominantEdgeColor(screenshot, block.boundingBox)
+                backgroundPaint.color = dominantBgColor
+
+                val bgRect = Rect(block.boundingBox).apply { inset(-2, -2) }
+                canvas.drawRect(bgRect, backgroundPaint)
+
+                textPaint.color = getContrastColor(dominantBgColor)
+                drawMultilineTextToFit(canvas, block.translatedText, block.boundingBox, textPaint)
+            }
+            return resultBitmap
+        } catch (error: Throwable) {
+            resultBitmap.takeUnless { it.isRecycled }?.recycle()
+            throw error
+        }
+    }
+
+    private fun copyMutableBitmap(screenshot: Bitmap): Bitmap {
+        return try {
+            screenshot.copy(Bitmap.Config.ARGB_8888, true)
+                ?: throw IllegalStateException("Failed to create bitmap copy")
+        } catch (error: OutOfMemoryError) {
+            throw IllegalStateException("Not enough memory to process screenshot", error)
+        }
     }
 
     /**
@@ -274,9 +556,16 @@ class ScreenTranslator : Closeable {
     }
     
     override fun close() {
+        if (!closed.compareAndSet(false, true)) return
         textRecognizer.close()
         languageIdentifier.close()
-        translators.values.forEach { it.close() }
-        translators.clear()
+        synchronized(translatorLock) {
+            translators.values.forEach(Translator::close)
+            translators.clear()
+        }
+    }
+
+    private fun checkOpen() {
+        check(!closed.get()) { "ScreenTranslator is already closed." }
     }
 }
