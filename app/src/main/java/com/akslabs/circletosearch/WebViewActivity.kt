@@ -28,15 +28,17 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.view.ViewGroup
 
 class WebViewActivity : Activity() {
 
     private val TAG = "WebViewActivity"
+    private var webView: WebView? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val webView = WebView(this)
+        val webView = WebView(this).also { this.webView = it }
         setContentView(webView)
 
         val url = intent.getStringExtra("url")
@@ -49,7 +51,6 @@ class WebViewActivity : Activity() {
         with(webView.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true // Enable DOM storage
-            databaseEnabled = true   // Enable database storage
             // Other potentially useful settings for modern web pages
             allowContentAccess = true
             allowFileAccess = true
@@ -72,12 +73,10 @@ class WebViewActivity : Activity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                Log.d(TAG, "onPageStarted: $url")
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                Log.d(TAG, "onPageFinished: $url")
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
@@ -89,19 +88,30 @@ class WebViewActivity : Activity() {
         }
 
         webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                super.onProgressChanged(view, newProgress)
-                Log.d(TAG, "Loading progress: $newProgress%")
-            }
-
             override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
-                super.onConsoleMessage(consoleMessage)
-                Log.d(TAG, "WebView Console: ${consoleMessage?.message()} -- From ${consoleMessage?.sourceId()}:${consoleMessage?.lineNumber()}")
-                return true // Indicate that the message has been handled
+                // Do not mirror arbitrary page console contents into logcat.
+                return true
             }
         }
         
-        Log.d(TAG, "Loading URL: $url")
         webView.loadUrl(url)
+    }
+
+    override fun onDestroy() {
+        // A WebView owns renderer, JavaScript and storage resources that are not
+        // released merely by destroying the Activity. Detach it first so the
+        // renderer cannot retain this Activity through the view hierarchy.
+        webView?.let { view ->
+            view.stopLoading()
+            view.loadUrl("about:blank")
+            view.clearHistory()
+            view.webChromeClient = null
+            view.webViewClient = WebViewClient()
+            (view.parent as? ViewGroup)?.removeView(view)
+            view.removeAllViews()
+            view.destroy()
+        }
+        webView = null
+        super.onDestroy()
     }
 }

@@ -152,7 +152,6 @@ object ImageSearchUploader {
             val responseCode = connection.responseCode
             if (responseCode == 200) {
                 val imageUrl = connection.inputStream.bufferedReader().use { it.readText().trim() }
-                Log.d(TAG, "Litterbox URL: $imageUrl (expires in 1h)")
                 imageUrl.ifBlank { null }
             } else {
                 Log.e(TAG, "Litterbox upload failed: $responseCode")
@@ -209,7 +208,6 @@ object ImageSearchUploader {
             val responseCode = connection.responseCode
             if (responseCode == 200) {
                 val imageUrl = connection.inputStream.bufferedReader().use { it.readText().trim() }
-                Log.d(TAG, "Catbox URL: $imageUrl")
                 imageUrl.ifBlank { null }
             } else {
                 Log.e(TAG, "Catbox upload failed: $responseCode")

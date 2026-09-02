@@ -32,12 +32,7 @@ object ImageUtils {
     fun saveBitmap(context: Context, bitmap: Bitmap, fileName: String = SCREENSHOT_FILENAME): String {
         val file = File(context.cacheDir, fileName)
         try {
-            FileOutputStream(file).use { out ->
-                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
-                    "Bitmap encoder rejected the image"
-                }
-                out.fd.sync()
-            }
+            writePng(bitmap, file)
         } catch (error: Throwable) {
             file.delete()
             throw error
@@ -45,22 +40,41 @@ object ImageUtils {
         return file.absolutePath
     }
 
+    /**
+     * Saves an image intended for an external share target. Unlike
+     * [saveBitmap], these files are placed in a bounded, app-owned cache so
+     * repeated shares cannot grow cache usage without limit.
+     */
+    fun saveShareBitmap(context: Context, bitmap: Bitmap, prefix: String): String {
+        return StorageUtils.writeTransientShareImage(context, prefix) { file ->
+            writePng(bitmap, file)
+        }.absolutePath
+    }
+
+    private fun writePng(bitmap: Bitmap, file: File) {
+        FileOutputStream(file).use { out ->
+            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                "Bitmap encoder rejected the image"
+            }
+            out.fd.sync()
+        }
+    }
+
     fun loadBitmap(path: String): Bitmap? {
         return BitmapFactory.decodeFile(path)
     }
 
-    fun cropBitmap(source: Bitmap, rect: Rect): Bitmap {
-        // Ensure rect is within bounds
+    fun cropBitmap(source: Bitmap, rect: Rect): Bitmap? {
+        if (source.isRecycled) return null
+        // Clamp both edges independently. Returning the source for an invalid
+        // crop can accidentally share/save the entire screenshot when a resize
+        // handle is dragged outside the display.
         val left = rect.left.coerceIn(0, source.width)
         val top = rect.top.coerceIn(0, source.height)
-        val width = rect.width().coerceAtMost(source.width - left)
-        val height = rect.height().coerceAtMost(source.height - top)
-        
-        return if (width > 0 && height > 0) {
-            Bitmap.createBitmap(source, left, top, width, height)
-        } else {
-            source // Fallback or handle error
-        }
+        val right = rect.right.coerceIn(0, source.width)
+        val bottom = rect.bottom.coerceIn(0, source.height)
+        if (right <= left || bottom <= top) return null
+        return Bitmap.createBitmap(source, left, top, right - left, bottom - top)
     }
 
     fun resizeBitmap(source: Bitmap, maxLength: Int): Bitmap {
