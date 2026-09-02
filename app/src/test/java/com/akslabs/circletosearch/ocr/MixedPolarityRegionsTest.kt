@@ -65,6 +65,89 @@ class MixedPolarityRegionsTest {
     }
 
     @Test
+    fun detectsNearWhiteTextWithoutLuminanceQuantizationLoss() {
+        listOf(238, 240, 244, 248).forEach { background ->
+            val width = 200
+            val height = 100
+            val pixels = IntArray(width * height) { color(255) }
+            fill(pixels, width, 20, 20, 180, 80, color(background))
+            // Two thin anti-aliased strokes are intentionally close to white.
+            fill(pixels, width, 38, 44, 162, 47, color(254))
+            fill(pixels, width, 38, 50, 146, 53, color(255))
+
+            val regions = MixedPolarityRegions.detect(
+                pixels,
+                width,
+                height,
+                requestedCellSize = 20,
+            )
+
+            assertTrue(
+                "Expected a fallback region for background=$background",
+                regions.any { it.left <= 38 && it.right >= 146 && it.top <= 44 && it.bottom >= 53 },
+            )
+        }
+    }
+
+    @Test
+    fun darkBackgroundDoesNotFloodFallbackToWholeScreen() {
+        val width = 400
+        val height = 800
+        val pixels = IntArray(width * height) { color(18) }
+        fill(pixels, width, 130, 370, 270, 374, color(250))
+        fill(pixels, width, 150, 380, 250, 384, color(250))
+
+        val region = MixedPolarityRegions.detect(
+            pixels,
+            width,
+            height,
+            requestedCellSize = 20,
+        ).single()
+
+        assertTrue(region.left <= 130 && region.right >= 250)
+        assertTrue(region.top <= 370 && region.bottom >= 384)
+        assertTrue(region.area < width.toLong() * height / 5)
+    }
+
+    @Test
+    fun isolatedBrightGlareIsNotATextSeed() {
+        val width = 200
+        val height = 120
+        val pixels = IntArray(width * height) { color(24) }
+        pixels[60 * width + 100] = color(255)
+
+        assertTrue(
+            MixedPolarityRegions.detect(
+                pixels,
+                width,
+                height,
+                requestedCellSize = 20,
+            ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun denseDarkScreenIsSplitIntoBoundedFallbackBands() {
+        val width = 400
+        val height = 800
+        val pixels = IntArray(width * height) { color(20) }
+        for (top in 30 until height - 20 step 35) {
+            fill(pixels, width, 30, top, 360, top + 3, color(248))
+        }
+
+        val regions = MixedPolarityRegions.detect(
+            pixels,
+            width,
+            height,
+            maxRegions = 2,
+            requestedCellSize = 20,
+        )
+
+        assertTrue(regions.isNotEmpty())
+        assertTrue(regions.all { it.height <= 120 })
+    }
+
+    @Test
     fun capsFallbackRegionCount() {
         val width = 300
         val height = 160
