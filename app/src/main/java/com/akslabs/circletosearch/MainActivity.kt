@@ -20,14 +20,15 @@
 
 package com.akslabs.circletosearch
 
+import android.app.role.RoleManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.service.voice.VoiceInteractionService
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -44,25 +45,34 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.DialogProperties
 import com.akslabs.circletosearch.ui.components.PrivacyDialog
 import com.akslabs.circletosearch.ui.theme.CircleToSearchTheme
 import com.akslabs.circletosearch.utils.PrivacyPreferences
+import com.akslabs.circletosearch.utils.StorageUtils
 
 import com.akslabs.circletosearch.ui.components.AccessibilityDisclosureDialog
 import com.akslabs.circletosearch.ui.components.UnifiedSearchMethodSelector
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                StorageUtils.pruneTransientImageCache(this@MainActivity)
+            } catch (error: Exception) {
+                android.util.Log.w(
+                    "CircleToSearch",
+                    "Unable to prune transient image cache",
+                    error,
+                )
+            }
+        }
         Toast.makeText(this, "Double tap status bar or use floating bubble to start.", Toast.LENGTH_LONG).show()
         setContent {
             CircleToSearchTheme {
@@ -92,7 +102,6 @@ class MainActivity : ComponentActivity() {
 fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    val prefs = context.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE)
     
     // Privacy Dialog State
     val privacyPreferences = remember { PrivacyPreferences(context) }
@@ -100,7 +109,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
     
     // Permission States
     var isAccessibilityEnabled by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
-    var isDefaultAssistant by remember { mutableStateOf(isDefaultAssistant(context)) }
+    var assistantState by remember { mutableStateOf(getAssistantActivationState(context)) }
     var showAccessibilityDisclosure by remember { mutableStateOf(false) }
     
     // Check permissions on Resume
@@ -108,24 +117,12 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
                 isAccessibilityEnabled = isAccessibilityServiceEnabled(context)
-                isDefaultAssistant = isDefaultAssistant(context)
+                assistantState = getAssistantActivationState(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-
-    val showSupportDialog = remember { mutableStateOf(!prefs.getBoolean("support_dialog_dismissed", false)) }
-    val dontShowAgain = remember { mutableStateOf(false) }
-    
-    // Manage Support Dialog Show Count
-    val showCount = remember { prefs.getInt("support_dialog_show_count", 0) }
-    LaunchedEffect(showSupportDialog.value) {
-        if (showSupportDialog.value) {
-            prefs.edit().putInt("support_dialog_show_count", showCount + 1).apply()
-        }
-    }
-    
 
     val sheetState = rememberModalBottomSheetState()
     val scope = rememberCoroutineScope()
@@ -273,7 +270,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
                 modifier = Modifier.align(Alignment.Start).padding(bottom = 8.dp)
             )
 
-            if (isDefaultAssistant) {
+            if (assistantState == AssistantActivationState.ACTIVE) {
                  // Granted State
                 Card(
                     colors = CardDefaults.cardColors(
@@ -301,6 +298,17 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
                     }
                 }
             } else {
+                val needsReconnect = assistantState == AssistantActivationState.DISCONNECTED
+                val cardContainerColor = if (needsReconnect) {
+                    MaterialTheme.colorScheme.errorContainer
+                } else {
+                    MaterialTheme.colorScheme.primaryContainer
+                }
+                val cardContentColor = if (needsReconnect) {
+                    MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                }
                  // Action State
                 Card(
                     onClick = {
@@ -308,7 +316,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
                         context.startActivity(intent)
                     },
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                        containerColor = cardContainerColor
                     ),
                     shape = androidx.compose.foundation.shape.RoundedCornerShape(24.dp),
                     modifier = Modifier.fillMaxWidth()
@@ -318,22 +326,34 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.TouchApp,
+                            imageVector = if (needsReconnect) {
+                                Icons.Default.Warning
+                            } else {
+                                Icons.Default.TouchApp
+                            },
                             contentDescription = null,
                             modifier = Modifier.size(24.dp),
-                            tint = MaterialTheme.colorScheme.onPrimaryContainer
+                            tint = cardContentColor
                         )
                         Spacer(modifier = Modifier.width(16.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Set as Default Assistant",
+                                text = if (needsReconnect) {
+                                    "Reconnect Default Assistant"
+                                } else {
+                                    "Set as Default Assistant"
+                                },
                                 style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                                color = cardContentColor
                             )
                             Text(
-                                text = "Hold the Home button or edge-swipe up to summon CircleToSearch — like calling your Pokémon.",
+                                text = if (needsReconnect) {
+                                    "Android still lists CircleToSearch as the assistant, but its voice service is disconnected. Tap here, choose None, then select CircleToSearch again. Until then, use the status-bar trigger or Quick Settings tile."
+                                } else {
+                                    "Hold the Home button or edge-swipe up to summon CircleToSearch — like calling your Pokémon."
+                                },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
+                                color = cardContentColor.copy(alpha = 0.8f)
                             )
                         }
                     }
@@ -432,20 +452,6 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
         }
     }
 
-    // Support Dialog & Sheet
-    if (showSupportDialog.value) {
-        SupportDialog(
-            showCount = showCount + 1,
-            onDismiss = {
-                showSupportDialog.value = false
-                if (dontShowAgain.value) {
-                    prefs.edit().putBoolean("support_dialog_dismissed", true).apply()
-                }
-            },
-            dontShowAgain = dontShowAgain
-        )
-    }
-
     if (showAccessibilityDisclosure) {
         AccessibilityDisclosureDialog(
             onAccept = {
@@ -484,22 +490,41 @@ fun isAccessibilityServiceEnabled(context: android.content.Context): Boolean {
     return false
 }
 
-fun isDefaultAssistant(context: android.content.Context): Boolean {
-    // Basic check: triggers the settings intent, but actual "is default" check is complex
-    // on some Android versions. For simplified UI, we might relay on user return, 
-    // or use RoleManager on Android 10+. 
-    // For now, let's keep it simple or check specific secure settings if possible.
-    // A reliable check is to see if we are arguably the voice interaction service.
-    
-    val assistant = Settings.Secure.getString(context.contentResolver, "voice_interaction_service")
-    val component = android.content.ComponentName(context, CircleToSearchVoiceService::class.java)
-    val myComponentString = component.flattenToString()
-    
-    // Check if our VoiceInteractionService is the one currently set as default
-    return assistant == myComponentString
+enum class AssistantActivationState {
+    ACTIVE,
+    DISCONNECTED,
+    NOT_SELECTED,
 }
 
-// ... SocialLinksRow, SupportDialog, BubbleSwitch same as before ...
+internal fun classifyAssistantActivation(
+    activeService: Boolean,
+    roleHeld: Boolean,
+): AssistantActivationState = when {
+    activeService -> AssistantActivationState.ACTIVE
+    roleHeld -> AssistantActivationState.DISCONNECTED
+    else -> AssistantActivationState.NOT_SELECTED
+}
+
+fun getAssistantActivationState(
+    context: android.content.Context,
+): AssistantActivationState {
+    val component = android.content.ComponentName(context, CircleToSearchVoiceService::class.java)
+    val activeService = VoiceInteractionService.isActiveService(context, component)
+
+    val roleManager = context.getSystemService(RoleManager::class.java)
+    val roleHeld = roleManager?.let {
+        it.isRoleAvailable(RoleManager.ROLE_ASSISTANT) &&
+            it.isRoleHeld(RoleManager.ROLE_ASSISTANT)
+    } == true
+
+    return classifyAssistantActivation(activeService, roleHeld)
+}
+
+fun isDefaultAssistant(context: android.content.Context): Boolean {
+    return getAssistantActivationState(context) == AssistantActivationState.ACTIVE
+}
+
+// ... SocialLinksRow and BubbleSwitch same as before ...
 @Composable
 fun SocialLinksRow(
     context: android.content.Context
@@ -544,180 +569,6 @@ fun SocialLinksRow(
 }
 
 @Composable
-fun SupportDialog(
-    showCount: Int,
-    onDismiss: () -> Unit,
-    dontShowAgain: MutableState<Boolean>
-) {
-    androidx.compose.ui.window.Dialog(
-        onDismissRequest = onDismiss,
-        properties = androidx.compose.ui.window.DialogProperties(
-            usePlatformDefaultWidth = false
-        )
-    ) {
-        androidx.compose.material3.Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp)
-                .clip(androidx.compose.foundation.shape.RoundedCornerShape(28.dp)),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp
-        ) {
-            // Outer column: wraps content naturally but caps height at 85% screen height
-            // using BoxWithConstraints so the scroll only kicks in when needed
-            androidx.compose.foundation.layout.BoxWithConstraints(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                val maxDialogHeight = maxHeight * 0.85f
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = maxDialogHeight),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    // ── Fixed header (always visible) ──────────────────────────
-                    Column(
-                        modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Icon(
-                            painter = painterResource(id = com.akslabs.circletosearch.R.drawable.donation),
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(48.dp)
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "Help Keep this Project \n Alive! ❤️",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.ExtraBold,
-                            textAlign = TextAlign.Center
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                    }
-
-                    // ── Scrollable body ────────────────────────────────────────
-                    var isExpanded by remember { mutableStateOf(false) }
-                    Column(
-                        modifier = Modifier
-                            .weight(1f, fill = false)
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 24.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "Please consider donating to this project Your\n support helps keep this project alive and \n enable us to add amazing \nnew features.",
-                            style = MaterialTheme.typography.bodyLarge,
-                            lineHeight = 22.sp,
-                            textAlign = TextAlign.Center,
-                            fontWeight = FontWeight.Medium
-                        )
-
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                .padding(16.dp)
-                                .animateContentSize()
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().clickable { isExpanded = !isExpanded },
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "Planned Features:",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                TextButton(onClick = { isExpanded = !isExpanded }, contentPadding = PaddingValues(0.dp)) {
-                                    Icon(
-                                        imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                        contentDescription = if (isExpanded) "Collapse" else "Expand",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                            }
-
-                            val allFeatures = listOf(
-                                "Self-hosted image upload (remove catbox/litterbox dependency)",
-                                "More triggers: volume button, power button, shake gesture etc.",
-                                "Add more actions to trigger with overlay",
-                                "Offline on-device translation",
-                                "Improved text detection accuracy",
-                                "More Search engines support SearXNG, DuckDuckGo, Brave Search",
-                                "Add more QS tiles to directly launch copy text, QR code, SmartScan etc.",
-                                "Multi-language support",
-                                "More Overlay actions",
-                                "Long-press image to download or share",
-                                "Image result context menu (reverse search, save, open etc.)",
-                                "Material You dynamic theming improvements",
-                                "Floating bubble customization (size, opacity, position)",
-                            )
-
-                            val features = if (isExpanded) allFeatures else allFeatures.take(5)
-
-                            Spacer(modifier = Modifier.height(12.dp))
-                            features.forEach { feature ->
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(vertical = 4.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Check, null,
-                                        modifier = Modifier.size(16.dp),
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Text(text = feature, style = MaterialTheme.typography.bodyMedium)
-                                }
-                            }
-                        }
-
-                        if (showCount >= 7) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                                    .clickable { dontShowAgain.value = !dontShowAgain.value }
-                                    .padding(vertical = 4.dp)
-                            ) {
-                                Checkbox(
-                                    checked = dontShowAgain.value,
-                                    onCheckedChange = { dontShowAgain.value = it }
-                                )
-                                Text(
-                                    text = "Don't show this again",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.padding(start = 8.dp)
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                    }
-
-                    // ── Fixed bottom buttons (always visible) ──────────────────
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 16.dp),
-                        horizontalArrangement = Arrangement.End,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        TextButton(onClick = onDismiss) {
-                            Text("Close")
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 fun BubbleSwitch(context: android.content.Context) {
     val prefs = context.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE)
     val isBubbleEnabled = remember { mutableStateOf(prefs.getBoolean("bubble_enabled", false)) }
@@ -739,4 +590,3 @@ fun BubbleSwitch(context: android.content.Context) {
         )
     )
 }
-
