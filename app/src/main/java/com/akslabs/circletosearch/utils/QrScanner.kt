@@ -12,7 +12,11 @@ import com.google.zxing.Result
 import com.google.zxing.ResultPoint
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.multi.GenericMultipleBarcodeReader
-import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.ensureActive
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
 sealed class QrResult {
     data class Url(val url: String, val displayUrl: String) : QrResult()
     data class WiFi(val ssid: String, val password: String?, val security: String) : QrResult()
@@ -28,29 +32,73 @@ data class QrResultWithBounds(
     val result: QrResult,
     val rawText: String,
     /** Bounds in bitmap pixel coords (may be null if position unavailable) */
-    val bounds: RectF?
+    val bounds: RectF?,
+    /** The actual symbology reported by ZXing. */
+    val format: BarcodeFormat? = null,
 )
 
 object QrScanner {
 
+    private val LINEAR_BARCODE_FORMATS = setOf(
+        BarcodeFormat.CODABAR,
+        BarcodeFormat.CODE_39,
+        BarcodeFormat.CODE_93,
+        BarcodeFormat.CODE_128,
+        BarcodeFormat.EAN_8,
+        BarcodeFormat.EAN_13,
+        BarcodeFormat.ITF,
+        BarcodeFormat.RSS_14,
+        BarcodeFormat.RSS_EXPANDED,
+        BarcodeFormat.UPC_A,
+        BarcodeFormat.UPC_E,
+        BarcodeFormat.UPC_EAN_EXTENSION,
+    )
+
+    private val SUPPORTED_FORMATS = LINEAR_BARCODE_FORMATS + setOf(
+        BarcodeFormat.QR_CODE,
+        BarcodeFormat.DATA_MATRIX,
+        BarcodeFormat.AZTEC,
+        BarcodeFormat.PDF_417,
+        BarcodeFormat.MAXICODE,
+    )
+
     private val HINTS = mapOf(
         DecodeHintType.TRY_HARDER to true,
-        DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)
+        DecodeHintType.ALSO_INVERTED to true,
+        DecodeHintType.POSSIBLE_FORMATS to SUPPORTED_FORMATS,
     )
 
     /** Scan for all barcodes / QR codes in the given bitmap. Returns a Flow of accumulating results. */
     fun scanBitmapAll(bitmap: Bitmap): kotlinx.coroutines.flow.Flow<List<QrResultWithBounds>> = kotlinx.coroutines.flow.flow {
         val allResults = mutableListOf<QrResultWithBounds>()
-        val foundTexts = mutableSetOf<String>()
 
         fun processResults(rawResults: List<com.google.zxing.Result>, xOffset: Int, yOffset: Int) {
             rawResults.forEach { raw ->
-                if (!foundTexts.contains(raw.text)) {
-                    foundTexts.add(raw.text)
-                    val globalBounds = computeBounds(raw.resultPoints)?.let { b ->
-                        android.graphics.RectF(b.left + xOffset, b.top + yOffset, b.right + xOffset, b.bottom + yOffset)
-                    }
-                    allResults.add(QrResultWithBounds(parseResult(raw.text), raw.text, globalBounds))
+                val globalBounds = computeBounds(raw.resultPoints)?.let { b ->
+                    RectF(
+                        b.left + xOffset,
+                        b.top + yOffset,
+                        b.right + xOffset,
+                        b.bottom + yOffset,
+                    )
+                }
+                val isDuplicate = allResults.any { existing ->
+                    isSameDetection(
+                        existing = existing,
+                        rawText = raw.text,
+                        format = raw.barcodeFormat,
+                        bounds = globalBounds,
+                    )
+                }
+                if (!isDuplicate) {
+                    allResults.add(
+                        QrResultWithBounds(
+                            result = parseResult(raw.text, raw.barcodeFormat),
+                            rawText = raw.text,
+                            bounds = globalBounds,
+                            format = raw.barcodeFormat,
+                        )
+                    )
                 }
             }
         }
@@ -59,10 +107,12 @@ object QrScanner {
             val w = bitmap.width
             val h = bitmap.height
 
-            // Load pixels once
-            val pixels = IntArray(w * h)
-            bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-            val baseSource = RGBLuminanceSource(w, h, pixels)
+            // Convert once. Keeping the temporary ARGB array inside the helper
+            // lets it become unreachable immediately after ZXing has produced
+            // its compact luminance buffer instead of retaining both arrays for
+            // every tile pass.
+            val baseSource = createLuminanceSource(bitmap)
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
 
             // Define all tiles for 3 levels of zoom
             val tileRegions = mutableListOf<android.graphics.Rect>()
@@ -114,22 +164,23 @@ object QrScanner {
         }
     }
 
+    private fun createLuminanceSource(bitmap: Bitmap): RGBLuminanceSource {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        return RGBLuminanceSource(width, height, pixels)
+    }
+
     /** Core scanner: tries Hybrid, Global, and Inverted versions of a source. */
     private fun scanLuminanceSource(source: com.google.zxing.LuminanceSource): List<com.google.zxing.Result> {
         val results = mutableListOf<com.google.zxing.Result>()
-        val foundTexts = mutableSetOf<String>()
         val multiReader = GenericMultipleBarcodeReader(MultiFormatReader())
 
         fun run(binarizer: com.google.zxing.Binarizer) {
             try {
                 val bitmap = BinaryBitmap(binarizer)
-                val raw = multiReader.decodeMultiple(bitmap, HINTS)
-                raw.forEach { r ->
-                    if (!foundTexts.contains(r.text)) {
-                        foundTexts.add(r.text)
-                        results.add(r)
-                    }
-                }
+                results.addAll(multiReader.decodeMultiple(bitmap, HINTS))
             } catch (e: NotFoundException) {
                 // Ignore
             } catch (e: Exception) {
@@ -143,22 +194,67 @@ object QrScanner {
         return results
     }
 
+    private fun isSameDetection(
+        existing: QrResultWithBounds,
+        rawText: String,
+        format: BarcodeFormat,
+        bounds: RectF?,
+    ): Boolean {
+        if (existing.format != format || existing.rawText != rawText) return false
 
+        val existingBounds = existing.bounds
+        if (existingBounds == null || bounds == null) {
+            // Some formats (notably MaxiCode) may not expose result points. In
+            // that case position cannot distinguish repeated tile detections,
+            // so the matching payload and symbology are the safest identity.
+            return true
+        }
+
+        val intersection = RectF(existingBounds)
+        val intersects = intersection.intersect(bounds)
+        if (intersects) {
+            val intersectionArea = intersection.width() * intersection.height()
+            val smallerArea = min(
+                existingBounds.width() * existingBounds.height(),
+                bounds.width() * bounds.height(),
+            )
+            if (smallerArea > 0f && intersectionArea / smallerArea >= 0.35f) {
+                return true
+            }
+        }
+
+        // Result points can shift slightly between the full-frame and cropped
+        // tile passes. Keep a small pixel tolerance without merging two nearby
+        // physical codes carrying the same payload.
+        val centerTolerance = max(
+            24f,
+            min(
+                max(existingBounds.width(), existingBounds.height()),
+                max(bounds.width(), bounds.height()),
+            ) * 0.12f,
+        )
+        return abs(existingBounds.centerX() - bounds.centerX()) <= centerTolerance &&
+            abs(existingBounds.centerY() - bounds.centerY()) <= centerTolerance
+    }
 
     private fun computeBounds(points: Array<ResultPoint>?): RectF? {
         if (points.isNullOrEmpty()) return null
         var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
         var maxX = Float.MIN_VALUE; var maxY = Float.MIN_VALUE
         for (p in points) {
-            if (p == null) continue
             if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x
             if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y
         }
         return if (minX == Float.MAX_VALUE) null else RectF(minX - 20f, minY - 20f, maxX + 20f, maxY + 20f)
     }
 
-    fun parseResult(text: String): QrResult {
+    fun parseResult(
+        text: String,
+        format: BarcodeFormat? = null,
+    ): QrResult {
         return when {
+            isLinearBarcode(format) -> QrResult.Product(text)
+            format != null && format != BarcodeFormat.QR_CODE -> QrResult.PlainText(text)
             text.startsWith("http://", ignoreCase = true) || text.startsWith("https://", ignoreCase = true) -> {
                 val display = text.removePrefix("http://").removePrefix("https://").trimEnd('/')
                 QrResult.Url(text, display)
@@ -167,9 +263,37 @@ object QrScanner {
             text.startsWith("tel:", ignoreCase = true) -> QrResult.Phone(text.removePrefix("tel:").trim())
             text.startsWith("BEGIN:VCARD", ignoreCase = true) -> parseVCard(text)
             text.startsWith("geo:", ignoreCase = true) -> parseGeo(text)
-            text.matches(Regex("\\d{8,14}")) -> QrResult.Product(text)
+            format == null && text.matches(Regex("\\d{8,14}")) -> QrResult.Product(text)
             else -> QrResult.PlainText(text)
         }
+    }
+
+    fun isLinearBarcode(format: BarcodeFormat?): Boolean =
+        format != null && format in LINEAR_BARCODE_FORMATS
+
+    fun isQrCode(format: BarcodeFormat?): Boolean =
+        format == BarcodeFormat.QR_CODE
+
+    fun formatDisplayName(format: BarcodeFormat?): String = when (format) {
+        BarcodeFormat.QR_CODE -> "QR code"
+        BarcodeFormat.DATA_MATRIX -> "Data Matrix"
+        BarcodeFormat.AZTEC -> "Aztec code"
+        BarcodeFormat.PDF_417 -> "PDF417"
+        BarcodeFormat.MAXICODE -> "MaxiCode"
+        BarcodeFormat.CODABAR -> "Codabar"
+        BarcodeFormat.CODE_39 -> "Code 39"
+        BarcodeFormat.CODE_93 -> "Code 93"
+        BarcodeFormat.CODE_128 -> "Code 128"
+        BarcodeFormat.EAN_8 -> "EAN-8"
+        BarcodeFormat.EAN_13 -> "EAN-13"
+        BarcodeFormat.ITF -> "ITF"
+        BarcodeFormat.RSS_14 -> "RSS-14"
+        BarcodeFormat.RSS_EXPANDED -> "RSS Expanded"
+        BarcodeFormat.UPC_A -> "UPC-A"
+        BarcodeFormat.UPC_E -> "UPC-E"
+        BarcodeFormat.UPC_EAN_EXTENSION -> "UPC/EAN extension"
+        null -> "Code"
+        else -> format.name.replace('_', ' ')
     }
 
     private fun parseWifi(text: String): QrResult {

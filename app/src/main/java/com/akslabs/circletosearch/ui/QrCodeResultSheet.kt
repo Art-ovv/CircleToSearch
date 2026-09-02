@@ -76,6 +76,7 @@ import androidx.compose.ui.unit.sp
 import com.akslabs.circletosearch.utils.QrResult
 import com.akslabs.circletosearch.utils.QrResultWithBounds
 import com.akslabs.circletosearch.utils.QrScanner
+import com.google.zxing.BarcodeFormat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -100,14 +101,24 @@ private fun openUrl(context: Context, url: String) {
     }
 }
 
-fun qrResultShortLabel(result: QrResult): String = when (result) {
-    is QrResult.Url       -> result.displayUrl.take(25)
-    is QrResult.WiFi      -> result.ssid
-    is QrResult.Phone     -> result.number
-    is QrResult.Product   -> result.barcode
-    is QrResult.VCard     -> result.name ?: "Contact"
-    is QrResult.GeoPoint  -> "%.2f, %.2f".format(result.lat, result.lng)
-    is QrResult.PlainText -> result.text.take(25)
+fun qrResultShortLabel(
+    result: QrResult,
+    format: BarcodeFormat? = null,
+): String {
+    val value = when (result) {
+        is QrResult.Url       -> result.displayUrl
+        is QrResult.WiFi      -> result.ssid
+        is QrResult.Phone     -> result.number
+        is QrResult.Product   -> result.barcode
+        is QrResult.VCard     -> result.name ?: "Contact"
+        is QrResult.GeoPoint  -> "%.2f, %.2f".format(result.lat, result.lng)
+        is QrResult.PlainText -> result.text
+    }
+    return if (format != null && !QrScanner.isQrCode(format)) {
+        "${QrScanner.formatDisplayName(format)} · $value".take(38)
+    } else {
+        value.take(25)
+    }
 }
 
 @Composable
@@ -156,7 +167,6 @@ fun QrCodeResultSheet(
                 if (found.isNotEmpty()) {
                     results = found
                     notFound = false
-                    isScanning = false
                 }
             }
         isScanning = false
@@ -174,10 +184,17 @@ fun QrCodeResultSheet(
             Row(modifier = Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.QrCode, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
+                val currentResult = results.getOrNull(
+                    pagerState.currentPage.coerceAtMost(results.lastIndex),
+                )
                 val titleText = when {
                     isScanning -> "Scanning…"
-                    notFound -> "No QR Found"
-                    results.size > 1 -> "Result ${pagerState.currentPage + 1} of ${results.size}"
+                    notFound -> "No code found"
+                    results.size > 1 -> {
+                        "${QrScanner.formatDisplayName(currentResult?.format)} " +
+                            "${pagerState.currentPage + 1} of ${results.size}"
+                    }
+                    currentResult != null -> QrScanner.formatDisplayName(currentResult.format)
                     else -> "QR / Barcode"
                 }
                 Text(titleText, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold), modifier = Modifier.weight(1f))
@@ -206,7 +223,7 @@ fun QrCodeResultSheet(
                         contentPadding = PaddingValues(horizontal = 16.dp),
                         pageSpacing = 12.dp
                     ) { page ->
-                        QrResultContent(context, results[page].result)
+                        QrResultContent(context, results[page])
                     }
                     
                     if (results.size > 1) {
@@ -257,21 +274,34 @@ fun NotFoundContent() {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(vertical = 4.dp)) {
         Text("🔎", fontSize = 32.sp)
         Spacer(Modifier.height(8.dp))
-        Text("No QR code detected", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        Text(
+            "No QR code or barcode detected",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
     }
 }
 
 @Composable
-fun QrResultContent(context: Context, result: QrResult) {
+fun QrResultContent(context: Context, scannedResult: QrResultWithBounds) {
     Box(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
-        when (result) {
-            is QrResult.Url       -> UrlResult(context, result)
-            is QrResult.WiFi      -> WifiResult(context, result)
-            is QrResult.Phone     -> PhoneResult(context, result)
-            is QrResult.Product   -> ProductResult(context, result)
-            is QrResult.VCard     -> VCardResult(context, result)
-            is QrResult.GeoPoint  -> GeoResult(context, result)
-            is QrResult.PlainText -> PlainTextResult(context, result)
+        val result = scannedResult.result
+        if (
+            scannedResult.format != null &&
+            !QrScanner.isQrCode(scannedResult.format) &&
+            !QrScanner.isLinearBarcode(scannedResult.format)
+        ) {
+            EncodedDataResult(context, scannedResult)
+        } else {
+            when (result) {
+                is QrResult.Url       -> UrlResult(context, result)
+                is QrResult.WiFi      -> WifiResult(context, result)
+                is QrResult.Phone     -> PhoneResult(context, result)
+                is QrResult.Product   -> ProductResult(context, result, scannedResult.format)
+                is QrResult.VCard     -> VCardResult(context, result)
+                is QrResult.GeoPoint  -> GeoResult(context, result)
+                is QrResult.PlainText -> PlainTextResult(context, result)
+            }
         }
     }
 }
@@ -325,16 +355,69 @@ private fun PhoneResult(context: Context, result: QrResult.Phone) {
 }
 
 @Composable
-private fun ProductResult(context: Context, result: QrResult.Product) {
+private fun ProductResult(
+    context: Context,
+    result: QrResult.Product,
+    format: BarcodeFormat?,
+) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(Icons.Default.ShoppingBag, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(40.dp))
         Spacer(Modifier.height(6.dp))
+        Text(
+            QrScanner.formatDisplayName(format),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text(result.barcode, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
         Spacer(Modifier.height(20.dp))
         ActionRow {
-            PrimaryAction("Amazon") { openUrl(context, "https://www.amazon.com/s?k=${result.barcode}") }
-            SecondaryAction("Google") { openUrl(context, "https://www.google.com/search?q=${result.barcode}") }
-            SecondaryAction("Copy") { copyToClipboard(context, "Barcode", result.barcode) }
+            PrimaryAction("Copy") { copyToClipboard(context, "Barcode", result.barcode) }
+            SecondaryAction("Google") {
+                openUrl(context, "https://www.google.com/search?q=${Uri.encode(result.barcode)}")
+            }
+            SecondaryAction("Amazon") {
+                openUrl(context, "https://www.amazon.com/s?k=${Uri.encode(result.barcode)}")
+            }
+        }
+    }
+}
+
+@Composable
+private fun EncodedDataResult(
+    context: Context,
+    scannedResult: QrResultWithBounds,
+) {
+    val formatName = QrScanner.formatDisplayName(scannedResult.format)
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Icon(
+            Icons.Default.QrCode,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(40.dp),
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            formatName,
+            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+        )
+        Text(
+            text = scannedResult.rawText,
+            style = MaterialTheme.typography.bodySmall.copy(lineHeight = 18.sp),
+            maxLines = 4,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp),
+        )
+        Spacer(Modifier.height(20.dp))
+        ActionRow {
+            PrimaryAction("Copy") {
+                copyToClipboard(context, formatName, scannedResult.rawText)
+            }
+            SecondaryAction("Search") {
+                openUrl(
+                    context,
+                    "https://www.google.com/search?q=${Uri.encode(scannedResult.rawText)}",
+                )
+            }
         }
     }
 }
