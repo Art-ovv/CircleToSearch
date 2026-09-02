@@ -29,6 +29,23 @@ internal class CaptureSessionCoordinator {
         return true
     }
 
+    /**
+     * Releases a reserved accessibility attempt that never actually started,
+     * allowing a transient BUSY/UNAVAILABLE result to be retried.
+     */
+    @Synchronized
+    fun releaseAccessibilityAttempt(expectedInvocationId: Long): Boolean {
+        if (
+            invocationId != expectedInvocationId ||
+            !accessibilityAttempted ||
+            winner != null
+        ) {
+            return false
+        }
+        accessibilityAttempted = false
+        return true
+    }
+
     @Synchronized
     fun tryComplete(expectedInvocationId: Long, source: CaptureSource): Boolean {
         if (invocationId != expectedInvocationId || winner != null) return false

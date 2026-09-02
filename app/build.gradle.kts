@@ -90,6 +90,9 @@ android {
     buildFeatures {
         compose = true
     }
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
 }
 
 // ABI-specific version codes for F-Droid and multi-APK support

@@ -23,5 +23,5 @@
     android:recognitionService="com.akslabs.circletosearch.CircleToSearchRecognitionService"
     android:settingsActivity="com.akslabs.circletosearch.MainActivity"
     android:supportsAssist="true"
-    android:supportsLaunchVoiceAssistFromKeyguard="true"
+    android:supportsLaunchVoiceAssistFromKeyguard="false"
     android:supportsLocalInteraction="true" />

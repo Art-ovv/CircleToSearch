@@ -20,6 +20,7 @@
 package com.akslabs.circletosearch
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityButtonController
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
@@ -55,6 +56,7 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.ViewConfiguration
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -65,6 +67,7 @@ import com.akslabs.circletosearch.data.OverlayConfigurationManager
 import com.akslabs.circletosearch.data.OverlaySegment
 import com.akslabs.circletosearch.ui.components.CopyTextOverlayManager
 import com.akslabs.circletosearch.utils.ImageUtils
+import com.akslabs.circletosearch.utils.StorageUtils
 import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -74,7 +77,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.SupervisorJob
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 internal enum class CaptureStartResult {
     STARTED,
@@ -86,12 +90,25 @@ internal enum class CaptureStartResult {
 internal sealed interface AssistantCaptureResult {
     data class Success(val bitmap: Bitmap) : AssistantCaptureResult
     data class Failure(val errorCode: Int?) : AssistantCaptureResult
+    data object Cancelled : AssistantCaptureResult
+}
+
+private const val ACCESSIBILITY_CAPTURE_TIMEOUT_MS = 3_000L
+
+private class ActiveCaptureRequest(
+    val id: Long,
+    val assistantOwnerId: Long?,
+    val assistantCallback: ((AssistantCaptureResult) -> Unit)?,
+) {
+    val timeoutGeneration = AtomicLong(0L)
 }
 
 class CircleToSearchAccessibilityService : AccessibilityService() {
 
     private var windowManager: WindowManager? = null
     private val overlayViews = mutableListOf<View>() // Track all added segment views
+    private val pinnedOverlayViews = mutableSetOf<View>()
+    private val pinnedActionMenus = mutableSetOf<View>()
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var configManager: OverlayConfigurationManager
@@ -99,11 +116,19 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
 
-    // Guards the WHOLE capture pipeline against re-entry. takeScreenshot is
-    // OS-throttled to ~1 call/sec per display; a second concurrent trigger
-    // (e.g. a stray fast double double-tap) would otherwise silently fail with
-    // ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT - the "Failed to start" bug.
-    private val captureInProgress = AtomicBoolean(false)
+    // The owner token prevents a late callback from an expired request from
+    // unlocking or publishing into a newer capture. The timeout also recovers
+    // if Android never calls either takeScreenshot callback.
+    private val captureRequestSequence = AtomicLong(0L)
+    private val activeCaptureRequest = AtomicReference<ActiveCaptureRequest?>(null)
+    private var accessibilityButtonRegistered = false
+    private val accessibilityButtonCallback =
+        object : AccessibilityButtonController.AccessibilityButtonCallback() {
+            override fun onClicked(controller: AccessibilityButtonController) {
+                android.util.Log.d("CircleToSearch", "Accessibility shortcut clicked")
+                performCapture()
+            }
+        }
     
     /** Kept by companion so scroll events can re-scan copy-text nodes. */
     internal var copyTextManager: CopyTextOverlayManager? = null
@@ -137,8 +162,24 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         val info = serviceInfo
         info.flags = info.flags or 
             android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-            android.accessibilityservice.AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
+            android.accessibilityservice.AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
+            android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON
         serviceInfo = info
+        instanceReference = WeakReference(this)
+
+        try {
+            accessibilityButtonController.registerAccessibilityButtonCallback(
+                accessibilityButtonCallback,
+                mainHandler,
+            )
+            accessibilityButtonRegistered = true
+        } catch (error: RuntimeException) {
+            android.util.Log.w(
+                "CircleToSearch",
+                "Unable to register the accessibility shortcut",
+                error,
+            )
+        }
         
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
         overlayPrefs.registerOnSharedPreferenceChangeListener(overlayPrefsListener)
@@ -162,6 +203,60 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         updateOverlay()
+        bubbleView?.let { view ->
+            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@let
+            val safeLayout = safeOverlayLayout(
+                width = params.width,
+                height = params.height,
+                x = params.x,
+                y = params.y,
+            )
+            params.width = safeLayout.width
+            params.height = safeLayout.height
+            params.x = safeLayout.x
+            params.y = safeLayout.y
+            try {
+                windowManager?.updateViewLayout(view, params)
+            } catch (_: Exception) {
+                // The bubble may have been removed while configuration changed.
+            }
+        }
+        pinnedOverlayViews.toList().forEach { view ->
+            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@forEach
+            val safeLayout = safeOverlayLayout(
+                width = params.width,
+                height = params.height,
+                x = params.x,
+                y = params.y,
+            )
+            params.width = safeLayout.width
+            params.height = safeLayout.height
+            params.x = safeLayout.x
+            params.y = safeLayout.y
+            try {
+                windowManager?.updateViewLayout(view, params)
+            } catch (_: Exception) {
+                pinnedOverlayViews.remove(view)
+            }
+        }
+        pinnedActionMenus.toList().forEach { menu ->
+            val params = menu.layoutParams as? WindowManager.LayoutParams ?: return@forEach
+            val safeLayout = safeOverlayLayout(
+                width = params.width,
+                height = params.height,
+                x = params.x,
+                y = params.y,
+            )
+            params.width = safeLayout.width
+            params.height = safeLayout.height
+            params.x = safeLayout.x
+            params.y = safeLayout.y
+            try {
+                windowManager?.updateViewLayout(menu, params)
+            } catch (_: Exception) {
+                pinnedActionMenus.remove(menu)
+            }
+        }
     }
 
     private fun updateBubbleState() {
@@ -175,20 +270,27 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private fun showBubble() {
         if (bubbleView != null) return // Already shown
 
+        val initialLayout = safeOverlayLayout(
+            width = 100,
+            height = 100,
+            x = 0,
+            y = 200,
+        )
         val params = WindowManager.LayoutParams(
-            100, 100,
+            initialLayout.width, initialLayout.height,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = 0
-        params.y = 200
+        params.x = initialLayout.x
+        params.y = initialLayout.y
 
         bubbleView = View(this).apply {
             setBackgroundResource(R.mipmap.ic_launcher)
             elevation = 10f
+            systemGestureExclusionRects = emptyList()
             
             var initialX = 0
             var initialY = 0
@@ -206,8 +308,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         true
                     }
                     MotionEvent.ACTION_MOVE -> {
-                        params.x = initialX + (event.rawX - initialTouchX).toInt()
-                        params.y = initialY + (event.rawY - initialTouchY).toInt()
+                        val safeLayout = safeOverlayLayout(
+                            width = params.width,
+                            height = params.height,
+                            x = initialX + (event.rawX - initialTouchX).toInt(),
+                            y = initialY + (event.rawY - initialTouchY).toInt(),
+                        )
+                        params.x = safeLayout.x
+                        params.y = safeLayout.y
                         windowManager?.updateViewLayout(this, params)
                         true
                     }
@@ -238,6 +346,56 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             }
             bubbleView = null
         }
+    }
+
+    private data class SafeOverlayLayout(
+        val width: Int,
+        val height: Int,
+        val x: Int,
+        val y: Int,
+    )
+
+    /** Keeps touchable accessibility windows away from Pixel's corner gesture strip. */
+    private fun safeOverlayLayout(
+        width: Int,
+        height: Int,
+        x: Int,
+        y: Int,
+    ): SafeOverlayLayout {
+        val displayWidth: Int
+        val displayHeight: Int
+        val mandatoryBottomInset: Int
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = windowManager?.currentWindowMetrics
+            val bounds = metrics?.bounds
+            displayWidth = bounds?.width() ?: resources.displayMetrics.widthPixels
+            displayHeight = bounds?.height() ?: resources.displayMetrics.heightPixels
+            mandatoryBottomInset = metrics?.windowInsets
+                ?.getInsetsIgnoringVisibility(WindowInsets.Type.mandatorySystemGestures())
+                ?.bottom
+                ?: 0
+        } else {
+            displayWidth = resources.displayMetrics.widthPixels
+            displayHeight = resources.displayMetrics.heightPixels
+            mandatoryBottomInset = 0
+        }
+
+        // Some vendor builds report a very small mandatory inset even though
+        // the assistant recognizer starts slightly above the physical corner.
+        val minimumCornerClearance = (48f * resources.displayMetrics.density).toInt()
+        val safeBottom = (
+            displayHeight - maxOf(mandatoryBottomInset, minimumCornerClearance)
+            ).coerceAtLeast(1)
+        val safeWidth = width.coerceIn(1, displayWidth.coerceAtLeast(1))
+        val safeHeight = height.coerceIn(1, safeBottom)
+
+        return SafeOverlayLayout(
+            width = safeWidth,
+            height = safeHeight,
+            x = x.coerceIn(0, (displayWidth - safeWidth).coerceAtLeast(0)),
+            y = y.coerceIn(0, (safeBottom - safeHeight).coerceAtLeast(0)),
+        )
     }
 
     private fun updateOverlay() {
@@ -300,13 +458,19 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             config.segments.forEachIndexed { index, segment ->
                 val view = overlayViews[index]
                 val params = view.layoutParams as WindowManager.LayoutParams
+                val safeLayout = safeOverlayLayout(
+                    width = segment.width,
+                    height = segment.height,
+                    x = segment.xOffset,
+                    y = segment.yOffset,
+                )
                 
                 // Update params
                 var changed = false
-                if (params.width != segment.width) { params.width = segment.width; changed = true }
-                if (params.height != segment.height) { params.height = segment.height; changed = true }
-                if (params.x != segment.xOffset) { params.x = segment.xOffset; changed = true }
-                if (params.y != segment.yOffset) { params.y = segment.yOffset; changed = true }
+                if (params.width != safeLayout.width) { params.width = safeLayout.width; changed = true }
+                if (params.height != safeLayout.height) { params.height = safeLayout.height; changed = true }
+                if (params.x != safeLayout.x) { params.x = safeLayout.x; changed = true }
+                if (params.y != safeLayout.y) { params.y = safeLayout.y; changed = true }
                 
                 if (changed) {
                     try {
@@ -351,9 +515,15 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             
             config.segments.forEachIndexed { index, segment ->
                 val view = View(this)
+                val safeLayout = safeOverlayLayout(
+                    width = segment.width,
+                    height = segment.height,
+                    x = segment.xOffset,
+                    y = segment.yOffset,
+                )
                 val params = WindowManager.LayoutParams(
-                    segment.width,
-                    segment.height,
+                    safeLayout.width,
+                    safeLayout.height,
                     WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -363,8 +533,9 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 )
                 
                 params.gravity = Gravity.TOP or Gravity.START
-                params.x = segment.xOffset
-                params.y = segment.yOffset
+                params.x = safeLayout.x
+                params.y = safeLayout.y
+                view.systemGestureExclusionRects = emptyList()
                 
                  if (config.isVisible) {
                     val color = themePalette[index % themePalette.size]
@@ -445,17 +616,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 return GestureType.SWIPE_DOWN in candidates &&
                     handleDefaultSwipeDown(segment, segmentIndex, e1.rawX)
             }
-        }).apply {
-             setOnDoubleTapListener(object : GestureDetector.OnDoubleTapListener {
-                override fun onSingleTapConfirmed(e: MotionEvent): Boolean = false
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    val action = segment.gestures[GestureType.DOUBLE_TAP] ?: ActionType.NONE
-                    if (action != ActionType.NONE) { performAction(action, segment); return true }
-                    return false
-                }
-                override fun onDoubleTapEvent(e: MotionEvent): Boolean = false
-            })
-        }
+        })
         
         var lastTapTime: Long = 0
         var tapCount = 0
@@ -506,21 +667,26 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
 
     private fun performAction(action: ActionType, segment: OverlaySegment) {
         if (action == ActionType.NONE) return
-        
-        // Haptic feedback for action trigger
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
-            vibratorManager.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+
+        val captureResult = when (action) {
+            ActionType.CTS_AUTO -> performCapture(null)
+            ActionType.CTS_LENS -> performCapture(true)
+            ActionType.CTS_MULTI -> performCapture(false)
+            else -> null
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-        } else {
-             @Suppress("DEPRECATION")
-            vibrator.vibrate(10)
+        if (captureResult != null) {
+            if (captureResult == CaptureStartResult.STARTED) {
+                vibrateAction()
+            } else {
+                android.util.Log.w(
+                    "CircleToSearch",
+                    "Overlay capture gesture could not start: $captureResult",
+                )
+            }
+            return
         }
+
+        vibrateAction()
 
         when(action) {
             ActionType.SCREENSHOT -> performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
@@ -544,23 +710,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                     }
                 }
             }
-            ActionType.CTS_AUTO -> {
-                 // Respect Global Preference
-                 performCapture(null)
-            }
-            ActionType.CTS_LENS -> {
-                 // Force Lens Mode for this session only
-                 performCapture(true)
-            }
-            ActionType.CTS_MULTI -> {
-                 // Force Multi Mode for this session only
-                 performCapture(false)
-            }
+            ActionType.CTS_AUTO,
+            ActionType.CTS_LENS,
+            ActionType.CTS_MULTI -> Unit // Handled before haptic feedback.
             ActionType.SPLIT_SCREEN -> {
-                 val success = performGlobalAction(GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN)
-                 if (!success) {
-                     android.widget.Toast.makeText(this, "Split Screen not supported or failed", android.widget.Toast.LENGTH_SHORT).show()
-                 }
+                val success = performGlobalAction(GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN)
+                if (!success) {
+                    android.widget.Toast.makeText(this, "Split Screen not supported or failed", android.widget.Toast.LENGTH_SHORT).show()
+                }
             }
             ActionType.SCROLL_TOP -> performScroll(true)
             ActionType.SCROLL_BOTTOM -> performScroll(false)
@@ -575,7 +732,24 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             ActionType.MEDIA_PLAY_PAUSE -> injectMediaKey(android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
             ActionType.MEDIA_NEXT -> injectMediaKey(android.view.KeyEvent.KEYCODE_MEDIA_NEXT)
             ActionType.MEDIA_PREVIOUS -> injectMediaKey(android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-            else -> {}
+            ActionType.NONE -> Unit
+        }
+    }
+
+    private fun vibrateAction() {
+        // Haptic feedback for action trigger
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+        } else {
+             @Suppress("DEPRECATION")
+            vibrator.vibrate(10)
         }
     }
     
@@ -723,37 +897,24 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private fun performCapture(
         searchModeOverride: Boolean? = null,
         translateScreen: Boolean = false,
+        assistantOwnerId: Long? = null,
         assistantCallback: ((AssistantCaptureResult) -> Unit)? = null,
     ): CaptureStartResult {
         android.util.Log.d("CircleToSearch", "performCapture called. hasWindowManager=${windowManager != null}")
 
-        // Re-entry guard over the WHOLE capture pipeline. Without this a second
-        // trigger fired before the first overlay launches races the OS
-        // screenshot throttle and dies silently (the "Failed to start" bug).
-        if (!captureInProgress.compareAndSet(false, true)) {
+        val request = ActiveCaptureRequest(
+            id = captureRequestSequence.incrementAndGet(),
+            assistantOwnerId = assistantOwnerId,
+            assistantCallback = assistantCallback,
+        )
+        if (!reserveCaptureRequest(request)) {
             android.util.Log.d("CircleToSearch", "Capture already in progress, skipping")
-            // Provide haptic feedback so user knows the gesture was received but blocked
-            try {
-                val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
-                    vibratorManager.defaultVibrator
-                } else {
-                    @Suppress("DEPRECATION")
-                    getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK))
-                } else {
-                    @Suppress("DEPRECATION")
-                    vibrator.vibrate(longArrayOf(0, 30, 50, 30), -1)
-                }
-            } catch (_: Exception) {}
             return CaptureStartResult.BUSY
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            captureInProgress.set(false)
-            if (assistantCallback == null) {
+            activeCaptureRequest.compareAndSet(request, null)
+            if (request.assistantCallback == null) {
                 android.widget.Toast.makeText(
                     this,
                     "Circle to Search capture requires Android 11 or newer",
@@ -763,38 +924,83 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             return CaptureStartResult.UNSUPPORTED
         }
 
-        if (assistantCallback == null) {
-            // Clear repository at the source to prevent any "ghost" flash of old data.
-            BitmapRepository.clear()
-        }
+        armCaptureTimeout(request, ACCESSIBILITY_CAPTURE_TIMEOUT_MS)
 
         return try {
             attemptScreenshot(
+                request = request,
                 searchModeOverride = searchModeOverride,
                 translateScreen = translateScreen,
                 retriesLeft = 2,
-                assistantCallback = assistantCallback,
             )
             CaptureStartResult.STARTED
         } catch (error: Exception) {
             android.util.Log.e("CircleToSearch", "Unable to start screenshot capture", error)
-            finishCaptureFailure(errorCode = null, assistantCallback = assistantCallback)
+            finishCaptureFailure(request = request, errorCode = null)
             CaptureStartResult.UNSUPPORTED
         }
     }
 
+    private fun reserveCaptureRequest(request: ActiveCaptureRequest): Boolean {
+        while (true) {
+            val current = activeCaptureRequest.get()
+            if (current == null) {
+                if (activeCaptureRequest.compareAndSet(null, request)) return true
+                continue
+            }
+
+            val replacesOlderCapture =
+                request.assistantCallback != null &&
+                    request.assistantOwnerId != current.assistantOwnerId
+            if (!replacesOlderCapture) return false
+            if (!activeCaptureRequest.compareAndSet(current, null)) continue
+
+            current.timeoutGeneration.incrementAndGet()
+            try {
+                current.assistantCallback?.invoke(AssistantCaptureResult.Cancelled)
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "CircleToSearch",
+                    "Failed to supersede stale assistant capture",
+                    error,
+                )
+            }
+        }
+    }
+
+    private fun armCaptureTimeout(request: ActiveCaptureRequest, timeoutMillis: Long) {
+        val timeoutGeneration = request.timeoutGeneration.incrementAndGet()
+        mainHandler.postDelayed(
+            {
+                if (request.timeoutGeneration.get() == timeoutGeneration) {
+                    android.util.Log.e(
+                        "CircleToSearch",
+                        "Capture request ${request.id} timed out",
+                    )
+                    finishCaptureFailure(request = request, errorCode = null)
+                }
+            },
+            timeoutMillis,
+        )
+    }
+
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
     private fun attemptScreenshot(
+        request: ActiveCaptureRequest,
         searchModeOverride: Boolean?,
         translateScreen: Boolean,
         retriesLeft: Int,
-        assistantCallback: ((AssistantCaptureResult) -> Unit)?,
     ) {
         takeScreenshot(
             Display.DEFAULT_DISPLAY,
             executor,
             object : TakeScreenshotCallback {
                 override fun onSuccess(screenshot: ScreenshotResult) {
+                    if (activeCaptureRequest.get() !== request) {
+                        screenshot.hardwareBuffer.close()
+                        return
+                    }
+
                     var copy: Bitmap? = null
                     try {
                         val hardwareBuffer = screenshot.hardwareBuffer
@@ -803,7 +1009,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         try {
                             hardwareBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
                             if (hardwareBitmap == null) {
-                                finishCaptureFailure(errorCode = null, assistantCallback = assistantCallback)
+                                finishCaptureFailure(request = request, errorCode = null)
                                 return
                             }
                             copy = hardwareBitmap.copy(Bitmap.Config.ARGB_8888, false)
@@ -813,16 +1019,22 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         }
 
                         if (copy == null) {
-                            finishCaptureFailure(errorCode = null, assistantCallback = assistantCallback)
+                            finishCaptureFailure(request = request, errorCode = null)
                             return
                         }
 
-                        if (assistantCallback != null) {
+                        if (request.assistantCallback != null) {
                             val capturedBitmap = checkNotNull(copy)
                             copy = null
-                            captureInProgress.set(false)
+                            if (!activeCaptureRequest.compareAndSet(request, null)) {
+                                capturedBitmap.takeUnless { it.isRecycled }?.recycle()
+                                return
+                            }
+                            request.timeoutGeneration.incrementAndGet()
                             try {
-                                assistantCallback(AssistantCaptureResult.Success(capturedBitmap))
+                                request.assistantCallback.invoke(
+                                    AssistantCaptureResult.Success(capturedBitmap),
+                                )
                             } catch (callbackError: Exception) {
                                 capturedBitmap.takeUnless { it.isRecycled }?.recycle()
                                 android.util.Log.e(
@@ -837,6 +1049,10 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         if (translateScreen) {
                             val sourceBitmap = checkNotNull(copy)
                             copy = null
+                            // Translation can legitimately take longer than the
+                            // screenshot callback. Invalidate the short capture
+                            // watchdog and retain owner identity for this phase.
+                            armCaptureTimeout(request, 60_000L)
                             serviceScope.launch {
                                 var translatedBitmap: Bitmap? = null
                                 try {
@@ -847,22 +1063,33 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                     sourceBitmap.recycle()
                                     withContext(Dispatchers.Main) {
                                         val completedBitmap = checkNotNull(translatedBitmap)
-                                        publishCapturedBitmap(completedBitmap, searchModeOverride)
+                                        publishCapturedBitmap(
+                                            request = request,
+                                            bitmap = completedBitmap,
+                                            searchModeOverride = searchModeOverride,
+                                        )
                                         translatedBitmap = null
                                     }
                                 } catch (error: CancellationException) {
                                     sourceBitmap.takeUnless { it.isRecycled }?.recycle()
                                     translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
-                                    captureInProgress.set(false)
+                                    activeCaptureRequest.compareAndSet(request, null)
                                     throw error
                                 } catch (e: Exception) {
                                     android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
                                     translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
                                     withContext(Dispatchers.Main) {
                                         if (!sourceBitmap.isRecycled) {
-                                            publishCapturedBitmap(sourceBitmap, searchModeOverride)
+                                            publishCapturedBitmap(
+                                                request = request,
+                                                bitmap = sourceBitmap,
+                                                searchModeOverride = searchModeOverride,
+                                            )
                                         } else {
-                                            captureInProgress.set(false)
+                                            finishCaptureFailure(
+                                                request = request,
+                                                errorCode = null,
+                                            )
                                         }
                                     }
                                 }
@@ -870,52 +1097,70 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         } else {
                             val capturedBitmap = checkNotNull(copy)
                             copy = null
-                            mainHandler.post {
-                                publishCapturedBitmap(capturedBitmap, searchModeOverride)
+                            val posted = mainHandler.post {
+                                publishCapturedBitmap(
+                                    request = request,
+                                    bitmap = capturedBitmap,
+                                    searchModeOverride = searchModeOverride,
+                                )
+                            }
+                            if (!posted) {
+                                capturedBitmap.takeUnless { it.isRecycled }?.recycle()
+                                finishCaptureFailure(request = request, errorCode = null)
                             }
                         }
 
                     } catch (e: Exception) {
                         copy?.takeUnless { it.isRecycled }?.recycle()
                         android.util.Log.e("CircleToSearch", "Screenshot conversion failed", e)
-                        finishCaptureFailure(errorCode = null, assistantCallback = assistantCallback)
+                        finishCaptureFailure(request = request, errorCode = null)
                     }
                 }
 
                 override fun onFailure(errorCode: Int) {
+                    if (activeCaptureRequest.get() !== request) return
                     android.util.Log.e("CircleToSearch", "Screenshot failed with error code: $errorCode")
 
-                    // The OS throttles takeScreenshot to ~1 call/sec per display. A
+                    // Android enforces a per-service screenshot interval. A
                     // too-soon call returns INTERVAL_TIME_SHORT; retry after the
                     // throttle window instead of failing the user's tap silently.
                     if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT && retriesLeft > 0) {
-                        mainHandler.postDelayed({
-                            try {
-                                attemptScreenshot(
-                                    searchModeOverride = searchModeOverride,
-                                    translateScreen = translateScreen,
-                                    retriesLeft = retriesLeft - 1,
-                                    assistantCallback = assistantCallback,
-                                )
-                            } catch (error: Exception) {
-                                android.util.Log.e("CircleToSearch", "Screenshot retry failed", error)
-                                finishCaptureFailure(null, assistantCallback)
-                            }
-                        }, 350L)
+                        val posted = mainHandler.postDelayed(
+                            {
+                                if (activeCaptureRequest.get() !== request) return@postDelayed
+                                try {
+                                    attemptScreenshot(
+                                        request = request,
+                                        searchModeOverride = searchModeOverride,
+                                        translateScreen = translateScreen,
+                                        retriesLeft = retriesLeft - 1,
+                                    )
+                                } catch (error: Exception) {
+                                    android.util.Log.e("CircleToSearch", "Screenshot retry failed", error)
+                                    finishCaptureFailure(request = request, errorCode = null)
+                                }
+                            },
+                            400L,
+                        )
+                        if (!posted) {
+                            finishCaptureFailure(request = request, errorCode = null)
+                        }
                         return
                     }
 
-                    finishCaptureFailure(errorCode = errorCode, assistantCallback = assistantCallback)
+                    finishCaptureFailure(request = request, errorCode = errorCode)
                 }
             }
         )
     }
 
     private fun finishCaptureFailure(
+        request: ActiveCaptureRequest,
         errorCode: Int?,
-        assistantCallback: ((AssistantCaptureResult) -> Unit)?,
     ) {
-        captureInProgress.set(false)
+        if (!activeCaptureRequest.compareAndSet(request, null)) return
+        request.timeoutGeneration.incrementAndGet()
+        val assistantCallback = request.assistantCallback
         if (assistantCallback != null) {
             try {
                 assistantCallback(AssistantCaptureResult.Failure(errorCode))
@@ -934,10 +1179,19 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun publishCapturedBitmap(bitmap: Bitmap, searchModeOverride: Boolean?) {
+    private fun publishCapturedBitmap(
+        request: ActiveCaptureRequest,
+        bitmap: Bitmap,
+        searchModeOverride: Boolean?,
+    ) {
+        if (!activeCaptureRequest.compareAndSet(request, null)) {
+            bitmap.takeUnless { it.isRecycled }?.recycle()
+            return
+        }
+        request.timeoutGeneration.incrementAndGet()
         try {
-            BitmapRepository.setScreenshot(bitmap)
-            launchOverlay(searchModeOverride)
+            val captureId = BitmapRepository.setScreenshot(bitmap)
+            launchOverlay(searchModeOverride, captureId)
         } catch (error: Exception) {
             BitmapRepository.clearIfSame(bitmap)
             bitmap.takeUnless { it.isRecycled }?.recycle()
@@ -947,23 +1201,29 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 "Couldn't open Circle to Search",
                 android.widget.Toast.LENGTH_SHORT,
             ).show()
-        } finally {
-            captureInProgress.set(false)
         }
     }
 
-    fun launchOverlay(searchModeOverride: Boolean? = null) {
+    fun launchOverlay(
+        searchModeOverride: Boolean? = null,
+        captureId: Long = BitmapRepository.getSnapshot()?.captureId
+            ?: BitmapRepository.NO_CAPTURE_ID,
+    ) {
         android.util.Log.d("CircleToSearchAccess", "AccessibilityService launching OverlayActivity")
         val intent = Intent(this, OverlayActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION) // Disable animation for faster feel
             searchModeOverride?.let { putExtra("EXTRA_SEARCH_MODE_OVERRIDE", it) }
+            if (captureId != BitmapRepository.NO_CAPTURE_ID) {
+                putExtra(OverlayActivity.EXTRA_CAPTURE_ID, captureId)
+            }
         }
         startActivity(intent)
     }
 
     // Custom ImageView that clips to rounded corners on the Canvas level
     // This is much more robust than OutlineProvider for rapid movements and scaling.
+    @SuppressLint("AppCompatCustomView")
     private class RoundedImageView(context: android.content.Context) : android.widget.ImageView(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val rect = RectF()
@@ -1019,8 +1279,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         android.util.Log.d("CircleToSearch", "showPinnedArea called for rect: $rect")
         
         val displayMetrics = resources.displayMetrics
-        val screenWidth = displayMetrics.widthPixels
+        var screenWidth = displayMetrics.widthPixels
         val screenHeight = displayMetrics.heightPixels
+        var safeScreenHeight = safeOverlayLayout(
+            width = screenWidth,
+            height = screenHeight,
+            x = 0,
+            y = 0,
+        ).height
 
         // Initial Position: Center of the selection
         val centerX = rect.centerX()
@@ -1031,8 +1297,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         val width = bitmap.width
         val height = bitmap.height
 
+        val initialLayout = safeOverlayLayout(
+            width = width,
+            height = height,
+            x = centerX - width / 2,
+            y = centerY - height / 2,
+        )
         val params = WindowManager.LayoutParams(
-            width, height,
+            initialLayout.width, initialLayout.height,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -1040,14 +1312,15 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = centerX - width / 2
-        params.y = centerY - height / 2
+        params.x = initialLayout.x
+        params.y = initialLayout.y
 
         val pinnedView = RoundedImageView(this).apply {
             setImageBitmap(bitmap)
             scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
             elevation = 0f
             clipToOutline = true
+            systemGestureExclusionRects = emptyList()
             
             var initialX = 0
             var initialY = 0
@@ -1079,7 +1352,12 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                     val minDim = (screenWidth * 0.15f).toInt()
                     val maxDim = (screenWidth * 0.95f).toInt()
                     
-                    if (newWidth in minDim..maxDim && newHeight in minDim..maxDim) {
+                    if (
+                        newWidth in minDim..maxDim &&
+                        newHeight in minDim..maxDim &&
+                        newWidth <= screenWidth &&
+                        newHeight <= safeScreenHeight
+                    ) {
                         // Adjust position to scale from center of pinch
                         val focusX = detector.focusX
                         val focusY = detector.focusY
@@ -1089,6 +1367,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         
                         params.width = newWidth
                         params.height = newHeight
+                        params.x = params.x.coerceIn(
+                            0,
+                            (screenWidth - params.width).coerceAtLeast(0),
+                        )
+                        params.y = params.y.coerceIn(
+                            0,
+                            (safeScreenHeight - params.height).coerceAtLeast(0),
+                        )
                         windowManager?.updateViewLayout(this@apply, params)
                     }
                     return true
@@ -1117,6 +1403,13 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
+                        screenWidth = resources.displayMetrics.widthPixels
+                        safeScreenHeight = safeOverlayLayout(
+                            width = screenWidth,
+                            height = resources.displayMetrics.heightPixels,
+                            x = 0,
+                            y = 0,
+                        ).height
                         initialX = params.x
                         initialY = params.y
                         initialTouchX = event.rawX
@@ -1141,12 +1434,21 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
                             isDragging = true
                             // If dragging, dismiss menu
-                            currentMenu?.let { try { windowManager?.removeView(it) } catch(e: Exception) {} }
+                            currentMenu?.let { menu ->
+                                try { windowManager?.removeView(menu) } catch (_: Exception) {}
+                                pinnedActionMenus.remove(menu)
+                            }
                             currentMenu = null
                         }
                         
-                        params.x = initialX + dx
-                        params.y = initialY + dy
+                        params.x = (initialX + dx).coerceIn(
+                            0,
+                            (screenWidth - params.width).coerceAtLeast(0),
+                        )
+                        params.y = (initialY + dy).coerceIn(
+                            0,
+                            (safeScreenHeight - params.height).coerceAtLeast(0),
+                        )
                         windowManager?.updateViewLayout(v, params)
                         velocityTracker?.addMovement(event)
                         true
@@ -1176,14 +1478,19 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                         params.y += (currVy * dt * 0.95f).toInt()
                                         
                                         // Bounce off edges (Bouncy!)
-                                        val display = resources.displayMetrics
-                                        if (params.x < 0 || params.x + params.width > display.widthPixels) {
+                                        if (params.x < 0 || params.x + params.width > screenWidth) {
                                             currVx = -currVx * 0.9f 
-                                            params.x = params.x.coerceIn(0, display.widthPixels - params.width)
+                                            params.x = params.x.coerceIn(
+                                                0,
+                                                (screenWidth - params.width).coerceAtLeast(0),
+                                            )
                                         }
-                                        if (params.y < 0 || params.y + params.height > display.heightPixels) {
+                                        if (params.y < 0 || params.y + params.height > safeScreenHeight) {
                                             currVy = -currVy * 0.9f
-                                            params.y = params.y.coerceIn(0, display.heightPixels - params.height)
+                                            params.y = params.y.coerceIn(
+                                                0,
+                                                (safeScreenHeight - params.height).coerceAtLeast(0),
+                                            )
                                         }
                                         
                                         try { 
@@ -1227,6 +1534,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
 
         try {
             windowManager?.addView(pinnedView, params)
+            pinnedOverlayViews += pinnedView
             
             // --- Beautiful Pin Animation ---
             pinnedView.scaleX = 0f
@@ -1315,20 +1623,56 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         // --- Action: Share ---
         menuLayout.addView(createTextActionButton("SHARE") {
             try {
-                val fileName = "share_pin_${java.util.UUID.randomUUID()}.png"
-                val path = ImageUtils.saveBitmap(this@CircleToSearchAccessibilityService, bitmap, fileName)
-                val file = java.io.File(path)
-                val uri = androidx.core.content.FileProvider.getUriForFile(this@CircleToSearchAccessibilityService, "com.akslabs.circletosearch.fileprovider", file)
-                val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                    type = "image/png"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                startActivity(Intent.createChooser(shareIntent, "Share Pin").apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
-            } catch (e: Exception) {
-                android.util.Log.e("CircleToSearch", "Failed to share pinned image", e)
+                windowManager?.removeView(menuLayout)
+            } catch (_: Exception) {
+                // The share can continue even if the transient menu was already removed.
             }
-            try { windowManager?.removeView(menuLayout) } catch (e: Exception) {}
+            pinnedActionMenus.remove(menuLayout)
+
+            serviceScope.launch {
+                try {
+                    val path = withContext(Dispatchers.IO) {
+                        ImageUtils.saveShareBitmap(
+                            context = this@CircleToSearchAccessibilityService,
+                            bitmap = bitmap,
+                            prefix = "pinned",
+                        )
+                    }
+                    val file = java.io.File(path)
+                    val uri = androidx.core.content.FileProvider.getUriForFile(
+                        this@CircleToSearchAccessibilityService,
+                        "com.akslabs.circletosearch.fileprovider",
+                        file,
+                    )
+                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "image/png"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        clipData = android.content.ClipData.newRawUri("Pinned selection", uri)
+                        addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_ACTIVITY_NEW_TASK,
+                        )
+                    }
+                    withContext(Dispatchers.Main.immediate) {
+                        startActivity(
+                            Intent.createChooser(shareIntent, "Share Pin").apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            },
+                        )
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    android.util.Log.e("CircleToSearch", "Failed to share pinned image", error)
+                    withContext(Dispatchers.Main.immediate) {
+                        android.widget.Toast.makeText(
+                            this@CircleToSearchAccessibilityService,
+                            "Could not share selection",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            }
         })
 
         // --- Action: Delete ---
@@ -1337,6 +1681,8 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 windowManager?.removeView(anchorView)
                 windowManager?.removeView(menuLayout)
             } catch (e: Exception) {}
+            pinnedOverlayViews.remove(anchorView)
+            pinnedActionMenus.remove(menuLayout)
         })
 
         // --- Action: Save ---
@@ -1344,6 +1690,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             val success = ImageUtils.saveToGallery(this@CircleToSearchAccessibilityService, bitmap)
             android.widget.Toast.makeText(this@CircleToSearchAccessibilityService, if (success) "Saved to Gallery" else "Save failed", android.widget.Toast.LENGTH_SHORT).show()
             try { windowManager?.removeView(menuLayout) } catch (e: Exception) {}
+            pinnedActionMenus.remove(menuLayout)
         }
         // Add spacing only if needed (not on the last item)
         menuLayout.addView(saveBtn)
@@ -1384,9 +1731,21 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         } else {
             anchorParams.y + anchorParams.height + yPadding
         }
+        val safeMenuLayout = safeOverlayLayout(
+            width = measuredMenuWidth,
+            height = measuredMenuHeight,
+            x = menuParams.x,
+            y = menuParams.y,
+        )
+        menuParams.x = safeMenuLayout.x
+        menuParams.y = safeMenuLayout.y
+        menuParams.width = safeMenuLayout.width
+        menuParams.height = safeMenuLayout.height
+        menuLayout.systemGestureExclusionRects = emptyList()
 
         try {
             windowManager?.addView(menuLayout, menuParams)
+            pinnedActionMenus += menuLayout
             onMenuCreated(menuLayout)
         } catch (e: Exception) {
             android.util.Log.e("CircleToSearch", "Failed to add menu view", e)
@@ -1415,13 +1774,65 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         }
 
         internal fun triggerCapture(
+            assistantOwnerId: Long? = null,
             assistantCallback: ((AssistantCaptureResult) -> Unit)? = null,
         ): CaptureStartResult {
             android.util.Log.d("CircleToSearch", "triggerCapture static called. instance=${instance != null}")
             return instance?.performCapture(
                 searchModeOverride = null,
+                assistantOwnerId = assistantOwnerId,
                 assistantCallback = assistantCallback,
             ) ?: CaptureStartResult.UNAVAILABLE
+        }
+
+        internal fun cancelAssistantCapture(assistantOwnerId: Long) {
+            val service = instance ?: return
+            val request = service.activeCaptureRequest.get() ?: return
+            val callback = request.assistantCallback ?: return
+            if (
+                request.assistantOwnerId != assistantOwnerId ||
+                !service.activeCaptureRequest.compareAndSet(request, null)
+            ) {
+                return
+            }
+            request.timeoutGeneration.incrementAndGet()
+            try {
+                callback(AssistantCaptureResult.Cancelled)
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "CircleToSearch",
+                    "Failed to cancel losing assistant capture",
+                    error,
+                )
+            }
+        }
+
+        internal fun relaunchAssistantOverlay(
+            lease: AssistantInvocationGate.Lease,
+            assistToken: String?,
+            captureId: Long,
+        ): Boolean {
+            val service = instance ?: return false
+            return try {
+                val intent = Intent(service, OverlayActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    putExtra("triggered_by", "assistant_recovery")
+                    putExtra(OverlayActivity.EXTRA_ASSIST_INVOCATION_ID, lease.sessionId)
+                    putExtra(OverlayActivity.EXTRA_ASSIST_INVOCATION_GENERATION, lease.generation)
+                    putExtra(OverlayActivity.EXTRA_CAPTURE_ID, captureId)
+                    assistToken?.let { putExtra(OverlayActivity.EXTRA_ASSIST_TOKEN, it) }
+                }
+                service.startActivity(intent)
+                true
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "CircleToSearch",
+                    "Unable to relaunch assistant overlay ${lease.sessionId}",
+                    error,
+                )
+                false
+            }
         }
         
         fun triggerTranslateCapture() {
@@ -1437,9 +1848,26 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
 
     override fun onCreate() {
         super.onCreate()
-        instanceReference = WeakReference(this)
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                StorageUtils.pruneTransientImageCache(
+                    this@CircleToSearchAccessibilityService,
+                )
+            } catch (error: Exception) {
+                android.util.Log.w(
+                    "CircleToSearch",
+                    "Unable to prune transient image cache",
+                    error,
+                )
+            }
+        }
         // configManager init moved to onServiceConnected or safe lazy? 
         // WindowManager is needed for views which happens in onServiceConnected mostly.
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        if (instance === this) instanceReference.clear()
+        return super.onUnbind(intent)
     }
 
     override fun onLowMemory() {
@@ -1451,7 +1879,34 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         if (instance === this) instanceReference.clear()
-        mainHandler.removeCallbacksAndMessages(null)
+        if (accessibilityButtonRegistered) {
+            try {
+                accessibilityButtonController.unregisterAccessibilityButtonCallback(
+                    accessibilityButtonCallback,
+                )
+            } catch (error: RuntimeException) {
+                android.util.Log.w(
+                    "CircleToSearch",
+                    "Unable to unregister the accessibility shortcut",
+                    error,
+                )
+            }
+            accessibilityButtonRegistered = false
+        }
+        activeCaptureRequest.getAndSet(null)?.let { request ->
+            request.timeoutGeneration.incrementAndGet()
+            request.assistantCallback?.let { callback ->
+                try {
+                    callback(AssistantCaptureResult.Cancelled)
+                } catch (error: Exception) {
+                    android.util.Log.e(
+                        "CircleToSearch",
+                        "Failed to close active capture during service shutdown",
+                        error,
+                    )
+                }
+            }
+        }
         executor.shutdownNow()
         prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
         overlayPrefs.unregisterOnSharedPreferenceChangeListener(overlayPrefsListener)
@@ -1465,6 +1920,18 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 e.printStackTrace()
             }
         }
+        pinnedActionMenus.forEach { view ->
+            try {
+                windowManager?.removeView(view)
+            } catch (_: Exception) {}
+        }
+        pinnedActionMenus.clear()
+        pinnedOverlayViews.forEach { view ->
+            try {
+                windowManager?.removeView(view)
+            } catch (_: Exception) {}
+        }
+        pinnedOverlayViews.clear()
         hideBubble()
         super.onDestroy()
     }

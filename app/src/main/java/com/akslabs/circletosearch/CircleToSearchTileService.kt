@@ -5,6 +5,7 @@
 package com.akslabs.circletosearch
 
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
@@ -18,6 +19,7 @@ import android.util.Log
 
 class CircleToSearchTileService : TileService() {
 
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     override fun onClick() {
         super.onClick()
         

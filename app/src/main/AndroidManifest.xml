@@ -23,9 +23,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- Required by the user-facing per-app overlay exclusion picker. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
     <application
         android:allowBackup="true"
@@ -37,7 +39,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.CircleToSearch"
         android:enableOnBackInvokedCallback="true"
-        android:extractNativeLibs="true"
         tools:targetApi="31">
         <activity
             android:name=".MainActivity"
@@ -65,9 +66,38 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <!--
+          Android can retain ROLE_ASSISTANT while dropping VOICE_INTERACTION_SERVICE
+          after an app update. In that state SystemUI sends an explicit ACTION_ASSIST
+          activity intent to the saved voice-service component. PackageManager keeps
+          activity and service resolvers separate, so this alias safely handles that
+          degraded path while normal service binding still resolves the service below.
+        -->
+        <activity
+            android:name=".AssistantFallbackActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.CircleToSearch.Transparent" />
+
+        <activity-alias
+            android:name=".CircleToSearchVoiceService"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.ACCESS_VOICE_INTERACTION_SERVICE"
+            android:targetActivity=".AssistantFallbackActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".CircleToSearchVoiceService"
             android:exported="true"
+            android:process=":voice"
             android:permission="android.permission.BIND_VOICE_INTERACTION">
             <intent-filter>
                 <action android:name="android.service.voice.VoiceInteractionService" />
@@ -82,6 +112,10 @@
             android:permission="android.permission.BIND_VOICE_INTERACTION"
             android:exported="true" />
 
+        <receiver
+            android:name=".AssistantRecoveryReceiver"
+            android:exported="false" />
+
         <service
             android:name=".CircleToSearchRecognitionService"
             android:label="@string/app_name"
@@ -91,6 +125,9 @@
                 <action android:name="android.speech.RecognitionService" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+            <meta-data
+                android:name="android.speech"
+                android:resource="@xml/recognition_service_config" />
         </service>
 
         <activity
@@ -98,7 +135,8 @@
             android:exported="false"
             android:theme="@style/Theme.CircleToSearch.Transparent"
             android:excludeFromRecents="true"
-            android:launchMode="singleTask" />
+            android:launchMode="singleTask"
+            android:taskAffinity="" />
 
         <activity
             android:name=".TileTriggerActivity"

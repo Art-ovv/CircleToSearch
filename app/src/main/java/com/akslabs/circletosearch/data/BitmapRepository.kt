@@ -20,6 +20,7 @@
 package com.akslabs.circletosearch.data
 
 import android.graphics.Bitmap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -32,14 +33,47 @@ import java.util.concurrent.atomic.AtomicReference
  * publish only when its source is still the current screenshot.
  */
 object BitmapRepository {
-    private val screenshot = AtomicReference<Bitmap?>(null)
+    const val NO_CAPTURE_ID = Long.MIN_VALUE
 
-    fun setScreenshot(bitmap: Bitmap?) {
-        screenshot.set(bitmap)
+    @ConsistentCopyVisibility
+    data class Snapshot internal constructor(
+        val captureId: Long,
+        val bitmap: Bitmap,
+    )
+
+    private val nextCaptureId = AtomicLong(0L)
+    private val screenshot = AtomicReference<Snapshot?>(null)
+
+    /**
+     * Publishes a new capture and returns the identity that must travel with
+     * the Activity intent. Pairing the identity and bitmap in one atomic value
+     * prevents a delayed intent from accidentally displaying a newer capture.
+     */
+    fun setScreenshot(bitmap: Bitmap?): Long {
+        if (bitmap == null) {
+            screenshot.set(null)
+            return NO_CAPTURE_ID
+        }
+        val captureId = nextCaptureId.updateAndGet { previous ->
+            if (previous == Long.MAX_VALUE) 1L else previous + 1L
+        }
+        screenshot.set(Snapshot(captureId = captureId, bitmap = bitmap))
+        return captureId
     }
 
-    fun getScreenshot(): Bitmap? {
-        return screenshot.get()
+    fun getSnapshot(): Snapshot? = screenshot.get()
+
+    fun getSnapshot(expectedCaptureId: Long): Snapshot? =
+        screenshot.get()?.takeIf { it.captureId == expectedCaptureId }
+
+    fun getScreenshot(): Bitmap? = screenshot.get()?.bitmap
+
+    fun getScreenshot(expectedCaptureId: Long): Bitmap? =
+        getSnapshot(expectedCaptureId)?.bitmap
+
+    fun isCurrent(captureId: Long, bitmap: Bitmap): Boolean {
+        val current = screenshot.get()
+        return current?.captureId == captureId && current.bitmap === bitmap
     }
 
     fun clear() {
@@ -47,10 +81,27 @@ object BitmapRepository {
     }
 
     fun clearIfSame(bitmap: Bitmap): Boolean {
-        return screenshot.compareAndSet(bitmap, null)
+        while (true) {
+            val current = screenshot.get() ?: return false
+            if (current.bitmap !== bitmap) return false
+            if (screenshot.compareAndSet(current, null)) return true
+        }
+    }
+
+    fun clearIfSame(captureId: Long, bitmap: Bitmap): Boolean {
+        while (true) {
+            val current = screenshot.get() ?: return false
+            if (current.captureId != captureId || current.bitmap !== bitmap) return false
+            if (screenshot.compareAndSet(current, null)) return true
+        }
     }
 
     fun compareAndSetScreenshot(expected: Bitmap, replacement: Bitmap): Boolean {
-        return screenshot.compareAndSet(expected, replacement)
+        while (true) {
+            val current = screenshot.get() ?: return false
+            if (current.bitmap !== expected) return false
+            val updated = current.copy(bitmap = replacement)
+            if (screenshot.compareAndSet(current, updated)) return true
+        }
     }
 }

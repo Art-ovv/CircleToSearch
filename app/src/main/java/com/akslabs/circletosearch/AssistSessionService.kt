@@ -19,7 +19,6 @@
 
 package com.akslabs.circletosearch
 
-import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -29,15 +28,29 @@ import android.os.Looper
 import android.service.voice.VoiceInteractionSession
 import android.service.voice.VoiceInteractionSessionService
 import android.app.assist.AssistStructure
-import android.os.VibrationEffect
-import android.os.Vibrator
 import android.os.Build
 import android.widget.Toast
 import com.akslabs.circletosearch.data.BitmapRepository
 import com.akslabs.circletosearch.data.AssistDataRepository
 
-private const val ASSIST_DELIVERY_TIMEOUT_MS = 10_000L
-private const val CAPTURE_FALLBACK_TIMEOUT_MS = 2_500L
+private const val CAPTURE_FALLBACK_TIMEOUT_MS = 5_000L
+private const val SYSTEM_SCREENSHOT_GRACE_MS = 250L
+private const val ACCESSIBILITY_RETRY_DELAY_MS = 400L
+private const val OVERLAY_LAUNCH_ACK_TIMEOUT_MS = 900L
+private const val ASSIST_DELIVERY_GRACE_MS = 600L
+
+internal fun shouldFinishUnshownAssistantSession(
+    expectedInvocationId: Long,
+    activeInvocationId: Long?,
+    shown: Boolean,
+    finishRequested: Boolean,
+    destroyed: Boolean,
+): Boolean {
+    return !destroyed &&
+        !finishRequested &&
+        activeInvocationId == expectedInvocationId &&
+        !shown
+}
 
 class AssistSessionService : VoiceInteractionSessionService() {
 
@@ -58,6 +71,7 @@ class AssistSessionService : VoiceInteractionSessionService() {
         private val receivedAssistIndices = mutableSetOf<Int>()
         private var legacyInvocationId = 0L
         private var activeInvocationId: Long? = null
+        private var activeVoiceLease: AssistantInvocationGate.Lease? = null
         private var activeAssistToken: String? = null
         private var destroyed = false
         private var shown = false
@@ -65,12 +79,39 @@ class AssistSessionService : VoiceInteractionSessionService() {
         private var assistComplete = true
         private var overlayLaunched = false
         private var captureTimeoutInvocationId: Long? = null
+        private var captureWatchdogGeneration = 0L
+        private var prepareWatchdogGeneration = 0L
+        private var captureDeadlineElapsedRealtime = 0L
+        private var discardScreenshotsUntilNextPrepare = false
         private var stagedPreShowBitmap: Bitmap? = null
         private var pendingBitmap: Bitmap? = null
+        private var finishRequested = false
 
         override fun onPrepareShow(args: Bundle?, showFlags: Int) {
             super.onPrepareShow(args, showFlags)
             setUiEnabled(false)
+
+            // finish() is terminal for a VoiceInteractionSession instance. If
+            // the framework delivers a queued prepare during teardown, leave it
+            // for the new session instead of reviving this finishing object.
+            if (destroyed) {
+                android.util.Log.w(
+                    "AssistSessionService",
+                    "Ignoring prepare callback on a destroyed session",
+                )
+                return
+            }
+            if (finishRequested) {
+                android.util.Log.w(
+                    "AssistSessionService",
+                    "Rejecting prepare callback on a finishing session",
+                )
+                // finish() is token-scoped and idempotent. Reasserting it makes
+                // a queued framework callback terminal instead of leaving the
+                // new show request attached to this dying session object.
+                finish()
+                return
+            }
 
             val invocationId = if (
                 Build.VERSION.SDK_INT >= 34 &&
@@ -84,17 +125,21 @@ class AssistSessionService : VoiceInteractionSessionService() {
             if (!captureCoordinator.begin(invocationId)) return
 
             recyclePendingBitmap()
-            mainHandler.removeCallbacksAndMessages(null)
             activeInvocationId = invocationId
+            activeVoiceLease = null
+            discardScreenshotsUntilNextPrepare = false
             shown = false
             assistExpected = showFlags and SHOW_WITH_ASSIST != 0
             assistComplete = !assistExpected
             overlayLaunched = false
             captureTimeoutInvocationId = null
+            captureWatchdogGeneration++
+            captureDeadlineElapsedRealtime =
+                android.os.SystemClock.elapsedRealtime() + CAPTURE_FALLBACK_TIMEOUT_MS
             receivedAssistIndices.clear()
-            BitmapRepository.clear()
             activeAssistToken = java.util.UUID.randomUUID().toString()
             AssistDataRepository.begin(checkNotNull(activeAssistToken))
+            schedulePrepareShowWatchdog(invocationId)
 
             stagedPreShowBitmap?.let { bitmap ->
                 stagedPreShowBitmap = null
@@ -105,45 +150,140 @@ class AssistSessionService : VoiceInteractionSessionService() {
         override fun onShow(args: Bundle?, showFlags: Int) {
             super.onShow(args, showFlags)
             android.util.Log.d("AssistSessionService", "onShow called with flags: $showFlags")
-            shown = true
-            vibrateInvocation()
 
-            val invocationId = activeInvocationId ?: return
+            if (destroyed || finishRequested) {
+                android.util.Log.w(
+                    "AssistSessionService",
+                    "Rejecting show callback on a terminal session",
+                )
+                if (!destroyed) finish()
+                return
+            }
+
+            val invocationId = activeInvocationId ?: run {
+                android.util.Log.e("AssistSessionService", "Show callback has no active invocation")
+                return
+            }
+            prepareWatchdogGeneration++
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val lease = AssistantInvocationGate.claimSession(invocationId)
+                if (lease == null) {
+                    android.util.Log.w(
+                        "AssistSessionService",
+                        "Ignoring completed recovery session $invocationId",
+                    )
+                    discardRejectedInvocation(invocationId)
+                    return
+                }
+                activeVoiceLease = lease
+                CircleToSearchAccessibilityService.cancelAssistantCapture(invocationId)
+            }
+            captureDeadlineElapsedRealtime =
+                android.os.SystemClock.elapsedRealtime() + CAPTURE_FALLBACK_TIMEOUT_MS
+            shown = true
             pendingBitmap?.let { bitmap ->
                 pendingBitmap = null
                 launchAcceptedBitmap(invocationId, bitmap)
             }
 
-            if (captureCoordinator.shouldStartAccessibility(invocationId)) {
-                android.util.Log.d("AssistSessionService", "Requesting accessibility capture for $invocationId")
-                val startResult = CircleToSearchAccessibilityService.triggerCapture { result ->
-                    when (result) {
-                        is AssistantCaptureResult.Success -> mainHandler.post {
+            // Pixel normally supplies SHOW_WITH_SCREENSHOT within a few frames.
+            // Starting AccessibilityService.takeScreenshot at the same time races
+            // the system capture and leaves the next invocation stuck on BUSY.
+            val expectsSystemScreenshot = showFlags and SHOW_WITH_SCREENSHOT != 0
+            scheduleAccessibilityFallback(
+                invocationId = invocationId,
+                delayMillis = if (expectsSystemScreenshot) SYSTEM_SCREENSHOT_GRACE_MS else 0L,
+            )
+            scheduleCaptureWatchdog(invocationId, restart = true)
+        }
+
+        private fun scheduleAccessibilityFallback(
+            invocationId: Long,
+            delayMillis: Long,
+        ) {
+            if (
+                destroyed ||
+                activeInvocationId != invocationId ||
+                captureCoordinator.hasWinner(invocationId) ||
+                android.os.SystemClock.elapsedRealtime() >= captureDeadlineElapsedRealtime
+            ) {
+                return
+            }
+
+            mainHandler.postDelayed(
+                { startAccessibilityFallback(invocationId) },
+                delayMillis.coerceAtLeast(0L),
+            )
+        }
+
+        private fun startAccessibilityFallback(invocationId: Long) {
+            if (
+                destroyed ||
+                activeInvocationId != invocationId ||
+                captureCoordinator.hasWinner(invocationId) ||
+                android.os.SystemClock.elapsedRealtime() >= captureDeadlineElapsedRealtime ||
+                !captureCoordinator.shouldStartAccessibility(invocationId)
+            ) {
+                return
+            }
+
+            android.util.Log.d(
+                "AssistSessionService",
+                "Requesting accessibility fallback for $invocationId",
+            )
+            val startResult = CircleToSearchAccessibilityService.triggerCapture(
+                assistantOwnerId = invocationId,
+            ) { result ->
+                when (result) {
+                    is AssistantCaptureResult.Success -> {
+                        val posted = mainHandler.post {
                             acceptBitmap(
                                 invocationId = invocationId,
                                 source = CaptureSource.ACCESSIBILITY,
                                 bitmap = result.bitmap,
                             )
                         }
-                        is AssistantCaptureResult.Failure -> mainHandler.post {
-                            android.util.Log.w(
-                                "AssistSessionService",
-                                "Accessibility capture failed for $invocationId: ${result.errorCode}",
+                        if (!posted && !result.bitmap.isRecycled) {
+                            result.bitmap.recycle()
+                        }
+                    }
+                    is AssistantCaptureResult.Failure -> mainHandler.post {
+                        android.util.Log.w(
+                            "AssistSessionService",
+                            "Accessibility fallback failed for $invocationId: ${result.errorCode}",
+                        )
+                        if (captureCoordinator.releaseAccessibilityAttempt(invocationId)) {
+                            scheduleAccessibilityFallback(
+                                invocationId,
+                                ACCESSIBILITY_RETRY_DELAY_MS,
                             )
-                            scheduleCaptureWatchdog(invocationId)
+                        }
+                    }
+                    AssistantCaptureResult.Cancelled -> mainHandler.post {
+                        if (captureCoordinator.releaseAccessibilityAttempt(invocationId)) {
+                            scheduleAccessibilityFallback(
+                                invocationId,
+                                ACCESSIBILITY_RETRY_DELAY_MS,
+                            )
                         }
                     }
                 }
+            }
 
-                if (startResult != CaptureStartResult.STARTED) {
-                    android.util.Log.w(
-                        "AssistSessionService",
-                        "Accessibility capture did not start for $invocationId: $startResult",
+            when (startResult) {
+                CaptureStartResult.STARTED -> Unit
+                CaptureStartResult.BUSY,
+                CaptureStartResult.UNAVAILABLE -> {
+                    captureCoordinator.releaseAccessibilityAttempt(invocationId)
+                    scheduleAccessibilityFallback(
+                        invocationId,
+                        ACCESSIBILITY_RETRY_DELAY_MS,
                     )
-                    scheduleCaptureWatchdog(invocationId)
+                }
+                CaptureStartResult.UNSUPPORTED -> {
+                    captureCoordinator.releaseAccessibilityAttempt(invocationId)
                 }
             }
-            scheduleCaptureWatchdog(invocationId)
         }
 
         override fun onHandleAssist(state: AssistState) {
@@ -159,8 +299,10 @@ class AssistSessionService : VoiceInteractionSessionService() {
                 activeAssistToken?.let { token ->
                     processAssistStructure(token, state.assistStructure)
                 }
+                activeInvocationId?.takeIf { overlayLaunched }?.let {
+                    finishAfterAssistDelivery(it)
+                }
             }
-            activeInvocationId?.let(::maybeHideSession)
         }
 
         private fun processAssistStructure(token: String, structure: AssistStructure?) {
@@ -181,10 +323,6 @@ class AssistSessionService : VoiceInteractionSessionService() {
                     android.util.Log.d("AssistSessionService", "Skipping non-default display window")
                     continue
                 }
-                val windowTitle = windowNode.title?.toString() ?: "No Title"
-                
-                android.util.Log.d("AssistSessionService", "Processing Window [$i]: \"$windowTitle\"")
-                
                 val windowOffsetX = windowNode.left
                 val windowOffsetY = windowNode.top
                 
@@ -313,7 +451,7 @@ class AssistSessionService : VoiceInteractionSessionService() {
             super.onHandleScreenshot(screenshot)
             android.util.Log.d("AssistSessionService", "onHandleScreenshot received, bitmap null? ${screenshot == null}")
 
-            if (destroyed) {
+            if (destroyed || discardScreenshotsUntilNextPrepare) {
                 screenshot?.takeUnless { it.isRecycled }?.recycle()
                 return
             }
@@ -327,7 +465,10 @@ class AssistSessionService : VoiceInteractionSessionService() {
                     acceptBitmap(invocationId, CaptureSource.SYSTEM_SCREENSHOT, screenshot)
                 }
             } else {
-                activeInvocationId?.let(::scheduleCaptureWatchdog)
+                activeInvocationId?.let { invocationId ->
+                    scheduleAccessibilityFallback(invocationId, 0L)
+                    scheduleCaptureWatchdog(invocationId)
+                }
             }
         }
 
@@ -339,6 +480,7 @@ class AssistSessionService : VoiceInteractionSessionService() {
             if (
                 destroyed ||
                 activeInvocationId != invocationId ||
+                !canAcceptVoiceBitmap() ||
                 !captureCoordinator.tryComplete(invocationId, source)
             ) {
                 if (!bitmap.isRecycled) bitmap.recycle()
@@ -346,6 +488,9 @@ class AssistSessionService : VoiceInteractionSessionService() {
             }
 
             android.util.Log.d("AssistSessionService", "$source won capture for $invocationId")
+            if (source == CaptureSource.SYSTEM_SCREENSHOT && shown) {
+                CircleToSearchAccessibilityService.cancelAssistantCapture(invocationId)
+            }
             if (!shown) {
                 pendingBitmap = bitmap
                 return
@@ -359,34 +504,114 @@ class AssistSessionService : VoiceInteractionSessionService() {
                 if (!bitmap.isRecycled) bitmap.recycle()
                 return
             }
-
-            BitmapRepository.setScreenshot(bitmap)
-            if (launchOverlayDirectly()) {
-                overlayLaunched = true
-                maybeHideSession(invocationId)
-            } else {
-                BitmapRepository.clearIfSame(bitmap)
+            if (!ownsVoiceInvocation()) {
                 if (!bitmap.isRecycled) bitmap.recycle()
                 captureCoordinator.cancel(invocationId)
                 shown = false
-                hide()
+                finishSession(invocationId)
+                return
+            }
+
+            val captureId = BitmapRepository.setScreenshot(bitmap)
+            if (launchOverlayDirectly(captureId)) {
+                overlayLaunched = true
+                activeVoiceLease?.let { lease ->
+                    scheduleOverlayLaunchAcknowledgement(
+                        invocationId = invocationId,
+                        lease = lease,
+                        captureId = captureId,
+                        bitmap = bitmap,
+                        assistToken = activeAssistToken,
+                        attempt = 0,
+                        delayMillis = OVERLAY_LAUNCH_ACK_TIMEOUT_MS,
+                    )
+                }
+                finishAfterAssistDelivery(invocationId)
+            } else if (activeVoiceLease != null) {
+                overlayLaunched = true
+                scheduleOverlayLaunchAcknowledgement(
+                    invocationId = invocationId,
+                    lease = checkNotNull(activeVoiceLease),
+                    captureId = captureId,
+                    bitmap = bitmap,
+                    assistToken = activeAssistToken,
+                    attempt = 0,
+                    delayMillis = 0L,
+                )
+                finishAfterAssistDelivery(invocationId)
+            } else {
+                BitmapRepository.clearIfSame(captureId, bitmap)
+                if (!bitmap.isRecycled) bitmap.recycle()
+                captureCoordinator.cancel(invocationId)
+                shown = false
+                finishSession(invocationId)
             }
         }
 
-        private fun launchOverlayDirectly(): Boolean {
+        private fun ownsVoiceInvocation(): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+            val lease = activeVoiceLease ?: return false
+            return AssistantInvocationGate.isSessionOwner(lease)
+        }
+
+        private fun finishAfterAssistDelivery(invocationId: Long) {
+            if (!assistExpected || assistComplete) {
+                finishSession(invocationId)
+                return
+            }
+
+            // Screenshot delivery often wins the race by a few frames. Keep the
+            // session alive briefly so its semantic AssistStructure can enrich
+            // OCR, but retain the bounded finish that prevents a stale assistant
+            // binder from breaking the next corner gesture.
+            mainHandler.postDelayed({
+                if (
+                    !destroyed &&
+                    activeInvocationId == invocationId &&
+                    overlayLaunched
+                ) {
+                    finishSession(invocationId)
+                }
+            }, ASSIST_DELIVERY_GRACE_MS)
+        }
+
+        private fun canAcceptVoiceBitmap(): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+            val lease = activeVoiceLease
+            return if (lease == null) !shown else AssistantInvocationGate.isSessionOwner(lease)
+        }
+
+        private fun launchOverlayDirectly(captureId: Long): Boolean {
             android.util.Log.d("AssistSessionService", "Launching OverlayActivity")
             val intent = Intent(context, OverlayActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
                 putExtra("triggered_by", "assistant")
+                putExtra(OverlayActivity.EXTRA_CAPTURE_ID, captureId)
                 activeAssistToken?.let { putExtra(OverlayActivity.EXTRA_ASSIST_TOKEN, it) }
+                activeVoiceLease?.let { lease ->
+                    putExtra(OverlayActivity.EXTRA_ASSIST_INVOCATION_ID, lease.sessionId)
+                    putExtra(OverlayActivity.EXTRA_ASSIST_INVOCATION_GENERATION, lease.generation)
+                }
+            }
+
+            activeVoiceLease?.let { lease ->
+                if (
+                    CircleToSearchAccessibilityService.relaunchAssistantOverlay(
+                        lease = lease,
+                        assistToken = activeAssistToken,
+                        captureId = captureId,
+                    )
+                ) {
+                    return true
+                }
             }
 
             return try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    startAssistantActivity(intent, ActivityOptions.makeBasic().toBundle())
-                } else {
-                    startAssistantActivity(intent)
-                }
+                // Keep the visual overlay in a regular application task. An
+                // assistant task remains attached to the session token and can
+                // briefly occlude the next corner gesture after it is closed.
+                context.startActivity(intent)
                 true
             } catch (e: Exception) {
                 android.util.Log.e("AssistSessionService", "Failed to launch OverlayActivity", e)
@@ -395,27 +620,193 @@ class AssistSessionService : VoiceInteractionSessionService() {
             }
         }
 
-        private fun maybeHideSession(invocationId: Long) {
-            if (invocationId != activeInvocationId || !overlayLaunched) return
-            if (!assistExpected || assistComplete) {
-                hide()
-                return
-            }
+        private fun scheduleOverlayLaunchAcknowledgement(
+            invocationId: Long,
+            lease: AssistantInvocationGate.Lease,
+            captureId: Long,
+            bitmap: Bitmap,
+            assistToken: String?,
+            attempt: Int,
+            delayMillis: Long,
+        ) {
+            mainHandler.postDelayed(
+                {
+                    if (
+                        !AssistantInvocationGate.isSessionOwner(lease) ||
+                        !BitmapRepository.isCurrent(captureId, bitmap)
+                    ) {
+                        return@postDelayed
+                    }
 
-            mainHandler.postDelayed({
-                if (activeInvocationId == invocationId && overlayLaunched) hide()
-            }, ASSIST_DELIVERY_TIMEOUT_MS)
+                    if (attempt >= 3) {
+                        android.util.Log.e(
+                            "AssistSessionService",
+                            "Overlay launch was never acknowledged for $invocationId",
+                        )
+                        AssistantInvocationGate.abandon(lease)
+                        BitmapRepository.clearIfSame(captureId, bitmap)
+                        assistToken?.let(AssistDataRepository::clear)
+                        return@postDelayed
+                    }
+
+                    android.util.Log.w(
+                        "AssistSessionService",
+                        "Overlay launch was not acknowledged for $invocationId; relaunching",
+                    )
+                    requestAssistantOverlayRelaunch(
+                        lease = lease,
+                        assistToken = assistToken,
+                        captureId = captureId,
+                        preferDirectLaunch = attempt % 2 == 1,
+                    )
+                    scheduleOverlayLaunchAcknowledgement(
+                        invocationId = invocationId,
+                        lease = lease,
+                        captureId = captureId,
+                        bitmap = bitmap,
+                        assistToken = assistToken,
+                        attempt = attempt + 1,
+                        delayMillis = OVERLAY_LAUNCH_ACK_TIMEOUT_MS,
+                    )
+                },
+                delayMillis,
+            )
         }
 
-        private fun scheduleCaptureWatchdog(invocationId: Long) {
+        private fun requestAssistantOverlayRelaunch(
+            lease: AssistantInvocationGate.Lease,
+            assistToken: String?,
+            captureId: Long,
+            preferDirectLaunch: Boolean,
+        ): Boolean {
+            if (!preferDirectLaunch &&
+                CircleToSearchAccessibilityService.relaunchAssistantOverlay(
+                    lease = lease,
+                    assistToken = assistToken,
+                    captureId = captureId,
+                )
+            ) {
+                return true
+            }
+
+            val directLaunchSucceeded = try {
+                context.startActivity(
+                    Intent(context, OverlayActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                        putExtra("triggered_by", "assistant_recovery")
+                        putExtra(OverlayActivity.EXTRA_CAPTURE_ID, captureId)
+                        putExtra(OverlayActivity.EXTRA_ASSIST_INVOCATION_ID, lease.sessionId)
+                        putExtra(
+                            OverlayActivity.EXTRA_ASSIST_INVOCATION_GENERATION,
+                            lease.generation,
+                        )
+                        assistToken?.let { putExtra(OverlayActivity.EXTRA_ASSIST_TOKEN, it) }
+                    },
+                )
+                true
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "AssistSessionService",
+                    "Fallback overlay launch failed for ${lease.sessionId}",
+                    error,
+                )
+                false
+            }
+            if (directLaunchSucceeded || !preferDirectLaunch) return directLaunchSucceeded
+
+            return CircleToSearchAccessibilityService.relaunchAssistantOverlay(
+                lease = lease,
+                assistToken = assistToken,
+                captureId = captureId,
+            )
+        }
+
+        private fun discardRejectedInvocation(invocationId: Long) {
+            captureCoordinator.cancel(invocationId)
+            recyclePendingBitmap()
+            activeAssistToken?.let(AssistDataRepository::clear)
+            activeAssistToken = null
+            shown = false
+            finishSession(invocationId)
+            activeInvocationId = null
+            activeVoiceLease = null
+            captureTimeoutInvocationId = null
+            captureWatchdogGeneration++
+            discardScreenshotsUntilNextPrepare = true
+        }
+
+        /**
+         * `hide()` keeps Android's active VoiceInteractionSession binder alive
+         * and reuses it for future gestures. If that retained session becomes
+         * stale, SystemUI still vibrates but never opens the app. `finish()`
+         * clears the active framework session so every gesture gets a fresh
+         * token, which is also what re-selecting the default assistant does.
+         */
+        private fun finishSession(expectedInvocationId: Long? = activeInvocationId) {
+            if (
+                destroyed ||
+                finishRequested ||
+                (expectedInvocationId != null && activeInvocationId != expectedInvocationId)
+            ) {
+                return
+            }
+            finishRequested = true
+            shown = false
+            prepareWatchdogGeneration++
+            // VoiceInteractionSession callbacks and every caller of this helper
+            // run on the main looper. Finishing synchronously is important: a
+            // queued finish from invocation N could otherwise run after Android
+            // has delivered onPrepareShow for invocation N+1 and destroy the
+            // fresh session before its overlay is launched.
+            finish()
+        }
+
+        private fun schedulePrepareShowWatchdog(invocationId: Long) {
+            val watchdogGeneration = ++prepareWatchdogGeneration
+            mainHandler.postDelayed({
+                if (prepareWatchdogGeneration != watchdogGeneration) return@postDelayed
+                if (!shouldFinishUnshownAssistantSession(
+                        expectedInvocationId = invocationId,
+                        activeInvocationId = activeInvocationId,
+                        shown = shown,
+                        finishRequested = finishRequested,
+                        destroyed = destroyed,
+                    )
+                ) {
+                    return@postDelayed
+                }
+
+                // A screenshot can arrive before onShow(), so this timeout must
+                // be independent of whether captureCoordinator already has a
+                // winner. Without a terminal finish, Android can retain a
+                // PREPARING session that blocks every later assist gesture.
+                android.util.Log.e(
+                    "AssistSessionService",
+                    "Show callback timed out for invocation $invocationId",
+                )
+                captureCoordinator.cancel(invocationId)
+                recyclePendingBitmap()
+                activeAssistToken?.let(AssistDataRepository::clear)
+                activeAssistToken = null
+                finishSession(invocationId)
+            }, CAPTURE_FALLBACK_TIMEOUT_MS)
+        }
+
+        private fun scheduleCaptureWatchdog(
+            invocationId: Long,
+            restart: Boolean = false,
+        ) {
             if (
                 destroyed ||
                 invocationId != activeInvocationId ||
-                captureTimeoutInvocationId == invocationId
+                (!restart && captureTimeoutInvocationId == invocationId)
             ) return
 
+            val watchdogGeneration = ++captureWatchdogGeneration
             captureTimeoutInvocationId = invocationId
             mainHandler.postDelayed({
+                if (captureWatchdogGeneration != watchdogGeneration) return@postDelayed
                 if (captureTimeoutInvocationId == invocationId) {
                     captureTimeoutInvocationId = null
                 }
@@ -431,24 +822,9 @@ class AssistSessionService : VoiceInteractionSessionService() {
                         "Couldn't capture the screen. Try again.",
                         Toast.LENGTH_LONG,
                     ).show()
-                    hide()
+                    finishSession(invocationId)
                 }
             }, CAPTURE_FALLBACK_TIMEOUT_MS)
-        }
-
-        private fun vibrateInvocation() {
-            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
-                manager.defaultVibrator
-            } else {
-                @Suppress("DEPRECATION")
-                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-            }
-            if (vibrator.hasVibrator()) {
-                vibrator.vibrate(
-                    VibrationEffect.createOneShot(50L, VibrationEffect.DEFAULT_AMPLITUDE),
-                )
-            }
         }
 
         private fun recyclePendingBitmap() {
@@ -459,16 +835,24 @@ class AssistSessionService : VoiceInteractionSessionService() {
         override fun onHide() {
             shown = false
             super.onHide()
+            // A hide can also be initiated by SystemUI before capture finishes.
+            // Make it terminal so Android cannot retain a wedged invisible
+            // assistant session for the next invocation.
+            finishSession()
         }
 
         override fun onDestroy() {
             destroyed = true
+            val leaseToRelease = activeVoiceLease?.takeUnless { overlayLaunched }
             activeInvocationId?.let(captureCoordinator::cancel)
             activeInvocationId = null
-            mainHandler.removeCallbacksAndMessages(null)
+            activeVoiceLease = null
+            captureWatchdogGeneration++
+            prepareWatchdogGeneration++
             recyclePendingBitmap()
             stagedPreShowBitmap?.takeUnless { it.isRecycled }?.recycle()
             stagedPreShowBitmap = null
+            leaseToRelease?.let(AssistantInvocationGate::abandon)
             super.onDestroy()
         }
 

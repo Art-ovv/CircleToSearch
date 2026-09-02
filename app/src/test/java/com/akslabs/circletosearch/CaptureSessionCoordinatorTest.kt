@@ -88,4 +88,24 @@ class CaptureSessionCoordinatorTest {
 
         assertFalse(coordinator.tryComplete(99L, CaptureSource.SYSTEM_SCREENSHOT))
     }
+
+    @Test
+    fun transientFailureCanReleaseAndRetryAccessibilityAttempt() {
+        val coordinator = CaptureSessionCoordinator()
+        coordinator.begin(100L)
+
+        assertTrue(coordinator.shouldStartAccessibility(100L))
+        assertTrue(coordinator.releaseAccessibilityAttempt(100L))
+        assertTrue(coordinator.shouldStartAccessibility(100L))
+    }
+
+    @Test
+    fun winningCaptureCannotBeReleasedForRetry() {
+        val coordinator = CaptureSessionCoordinator()
+        coordinator.begin(101L)
+
+        assertTrue(coordinator.shouldStartAccessibility(101L))
+        assertTrue(coordinator.tryComplete(101L, CaptureSource.SYSTEM_SCREENSHOT))
+        assertFalse(coordinator.releaseAccessibilityAttempt(101L))
+    }
 }
