@@ -134,7 +134,7 @@ class TextNodeMergerTest {
     }
 
     @Test
-    fun broadAssistContainerCanSuppressMatchingOcrText() {
+    fun partialOcrKeepsCompleteAssistBlockWithoutDuplicatingItsMatchedPassage() {
         val assist = node(
             "assist",
             "Ответ: Да как ты проверь информацию, тут ошибка",
@@ -152,9 +152,9 @@ class TextNodeMergerTest {
             bitmapHeight = 500,
         )
 
-        assertEquals(listOf("ocr"), result.map { it.id })
-        assertEquals("Да как ты проверь информацию,", result.single().fullText)
-        assertBoundsEqual(nestedOcr.words.single().bounds, result.single().words.single().bounds)
+        assertEquals(listOf("assist"), result.map { it.id })
+        assertEquals(assist.fullText, result.single().fullText)
+        assertBoundsEqual(assist.words.single().bounds, result.single().words.single().bounds)
     }
 
     @Test
@@ -229,6 +229,90 @@ class TextNodeMergerTest {
         )
 
         assertEquals(listOf("left", "correct", "right"), result.flatMap { it.words }.map { it.text })
+    }
+
+    @Test
+    fun missingOcrLinePreservesAssistParagraphAndUnrelatedImageText() {
+        val assist = node("assist", "Первая строка\nВторая строка", 0, 0, 200, 80)
+        val firstLine = nodeWithWords("first", listOf("Первая", "строка"), 0, 0, 100, 30)
+        val unrelated = node("image", "Изображение внутри чата", 0, 100, 200, 130)
+
+        val result = mergeTextNodes(listOf(assist), listOf(firstLine, unrelated), 200, 200)
+
+        assertEquals(listOf("assist", "image"), result.map { it.id })
+        assertEquals(assist.fullText, result.first().fullText)
+    }
+
+    @Test
+    fun completeOcrCoverageUsesGranularWordsFromBothLines() {
+        val assist = node("assist", "Первая строка\nВторая строка", 0, 0, 200, 80)
+        val firstLine = nodeWithWords("first", listOf("Первая", "строка"), 0, 0, 100, 30)
+        val secondLine = nodeWithWords("second", listOf("Вторая", "строка"), 0, 40, 100, 30)
+
+        // Completion depends on covered token positions, not on OCR callback/list order.
+        val result = mergeTextNodes(listOf(assist), listOf(secondLine, firstLine), 200, 200)
+
+        assertEquals(listOf("first", "second"), result.map { it.id })
+        assertEquals(listOf("Первая", "строка", "Вторая", "строка"),
+            result.flatMap { it.words }.map { it.text })
+        (firstLine.words + secondLine.words).zip(result.flatMap { it.words }).forEach { (old, new) ->
+            assertBoundsEqual(old.bounds, new.bounds)
+        }
+    }
+
+    @Test
+    fun duplicatePartialDetectionsCannotCountAsCompleteAssistCoverage() {
+        val assist = node("assist", "Первая строка\nВторая строка", 0, 0, 200, 80)
+        val firstLine = nodeWithWords("first", listOf("Первая", "строка"), 0, 0, 100, 30)
+
+        val result = mergeTextNodes(listOf(assist), listOf(firstLine, firstLine.copy(id = "duplicate")), 200, 200)
+
+        assertEquals(listOf("assist"), result.map { it.id })
+        assertEquals(assist.fullText, result.single().fullText)
+    }
+
+    @Test
+    fun unsuccessfulSemanticProjectionKeepsBothSources() {
+        val assist = node("assist", "one two three", 0, 0, 300, 80)
+        val ocr = nodeWithWords("ocr", listOf("one", "two", "three", "four", "five"), 0, 0, 50, 30)
+
+        val result = mergeTextNodes(listOf(assist), listOf(ocr), 300, 100)
+
+        assertEquals(setOf("assist", "ocr"), result.map { it.id }.toSet())
+        assertEquals(ocr.fullText, result.single { it.id == "ocr" }.fullText)
+    }
+
+    @Test
+    fun partialRefinementPreservesMissingWordsInsideRequestedRegion() {
+        val line = nodeWithWords("line", listOf("left", "replace", "right"), 0, 100, 100, 40)
+        val refined = node("refined", "correct", 105, 100, 195, 140)
+
+        val result = mergeRegionTextNodes(listOf(line), listOf(refined), rect(0, 90, 300, 150))
+
+        assertEquals(listOf("left", "correct", "right"), result.flatMap { it.words }.map { it.text })
+        assertBoundsEqual(line.words.first().bounds, result.first().words.single().bounds)
+        assertBoundsEqual(line.words.last().bounds, result.last().words.single().bounds)
+    }
+
+    @Test
+    fun partialRefinementPreservesMissingLineInsideRequestedRegion() {
+        val first = node("first", "First line", 0, 0, 200, 30)
+        val second = node("second", "Second line", 0, 50, 200, 80)
+        val refined = node("refined", "Corrected first line", 0, 0, 200, 30)
+
+        val result = mergeRegionTextNodes(listOf(first, second), listOf(refined), rect(0, 0, 200, 100))
+
+        assertEquals(listOf("refined", "second"), result.map { it.id })
+    }
+
+    @Test
+    fun neighbouringRefinementCannotEraseUnrelatedWordWithSmallOverlap() {
+        val existing = node("existing", "Keep", 0, 0, 100, 30)
+        val refined = node("refined", "Other", 60, 0, 160, 30)
+
+        val result = mergeRegionTextNodes(listOf(existing), listOf(refined), rect(0, 0, 200, 100))
+
+        assertEquals(listOf("existing", "refined"), result.map { it.id })
     }
 
     private fun node(
