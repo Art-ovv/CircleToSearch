@@ -23,6 +23,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityButtonController
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
@@ -187,15 +188,15 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         updateBubbleState()
         updateOverlay()
 
-        // Pre-warm Tesseract OCR engine in background so the first capture
-        // doesn't pay the 2-4 second cold-start cost of loading 30MB+ models.
+        // Pre-warm PaddleOCR in the service lifetime so the first capture does not pay for
+        // loading OpenCV and both ONNX models.
         serviceScope.launch {
             try {
-                com.akslabs.circletosearch.ocr.TesseractEngine.warmUp(this@CircleToSearchAccessibilityService)
+                com.akslabs.circletosearch.ocr.PaddleOcrEngine.warmUp(this@CircleToSearchAccessibilityService)
             } catch (error: CancellationException) {
                 throw error
             } catch (e: Exception) {
-                android.util.Log.e("CircleToSearch", "Tesseract warm-up failed", e)
+                android.util.Log.e("CircleToSearch", "PaddleOCR warm-up failed", e)
             }
         }
     }
@@ -1056,13 +1057,25 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                             serviceScope.launch {
                                 var translatedBitmap: Bitmap? = null
                                 try {
-                                    translatedBitmap = ScreenTranslator().use { translator ->
-                                        translator.translateScreen(sourceBitmap)
+                                    val outcome = ScreenTranslator(applicationContext).use { translator ->
+                                        translator.translateScreen(sourceBitmap, textNodes = null)
                                     }
-                                    // translateScreen creates its own copy - original copy can be released immediately
-                                    sourceBitmap.recycle()
+                                    when (outcome) {
+                                        is ScreenTranslationOutcome.Translated -> {
+                                            translatedBitmap = outcome.bitmap
+                                            sourceBitmap.recycle()
+                                        }
+                                        is ScreenTranslationOutcome.Unchanged -> {
+                                            translatedBitmap = sourceBitmap
+                                        }
+                                    }
                                     withContext(Dispatchers.Main) {
                                         val completedBitmap = checkNotNull(translatedBitmap)
+                                        if (activeCaptureRequest.get() === request) {
+                                            outcome.userMessage()?.let { message ->
+                                                android.widget.Toast.makeText(applicationContext, message, android.widget.Toast.LENGTH_LONG).show()
+                                            }
+                                        }
                                         publishCapturedBitmap(
                                             request = request,
                                             bitmap = completedBitmap,
@@ -1079,6 +1092,10 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                     android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
                                     translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
                                     withContext(Dispatchers.Main) {
+                                        if (activeCaptureRequest.get() === request) {
+                                            android.widget.Toast.makeText(applicationContext,
+                                                "Translation failed. Try again", android.widget.Toast.LENGTH_LONG).show()
+                                        }
                                         if (!sourceBitmap.isRecycled) {
                                             publishCapturedBitmap(
                                                 request = request,
@@ -1873,7 +1890,17 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     override fun onLowMemory() {
         super.onLowMemory()
         serviceScope.launch {
-            com.akslabs.circletosearch.ocr.TesseractEngine.releaseCachedEngine()
+            com.akslabs.circletosearch.ocr.PaddleOcrEngine.releaseCachedEngine()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) {
+            serviceScope.launch {
+                com.akslabs.circletosearch.ocr.PaddleOcrEngine.releaseCachedEngine()
+            }
         }
     }
 

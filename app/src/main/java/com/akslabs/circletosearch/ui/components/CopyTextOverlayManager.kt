@@ -15,7 +15,6 @@ import android.net.Uri
 import android.view.*
 import android.widget.FrameLayout
 import android.widget.Toast
-import com.akslabs.circletosearch.ScreenTranslationNode
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -59,7 +58,6 @@ class CopyTextOverlayManager(
 
     private val statusMessage = mutableStateOf<String?>(null)
     private val textNodes = mutableListOf<TextNode>()
-    private var translationTextSnapshot: List<ScreenTranslationNode> = emptyList()
     private var visualLines: List<List<Word>> = emptyList()
     private var allWords: List<Word> = emptyList()
 
@@ -82,10 +80,6 @@ class CopyTextOverlayManager(
      * Returns the number of found text nodes.
      */
     fun getNodeCount(): Int = textNodes.size
-
-    /** Immutable lightweight snapshot prepared once when OCR nodes change. */
-    internal fun getTranslationTextSnapshot(): List<ScreenTranslationNode> =
-        translationTextSnapshot
 
     /**
      * Checks if scanning is currently in progress.
@@ -119,15 +113,6 @@ class CopyTextOverlayManager(
         val sortedNodes = nodes.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
         textNodes.clear()
         textNodes.addAll(sortedNodes)
-        translationTextSnapshot = sortedNodes.map { node ->
-            ScreenTranslationNode(
-                text = node.fullText,
-                left = node.bounds.left,
-                top = node.bounds.top,
-                right = node.bounds.right,
-                bottom = node.bounds.bottom,
-            )
-        }
         updateAllWords()
 
         if (hadActiveSelection && startAnchor != null && endAnchor != null) {
@@ -259,7 +244,6 @@ class CopyTextOverlayManager(
         onDismissCallback = null
         onBackgroundTouchCallback = null
         onAnalysisCompleteCallback = null
-        translationTextSnapshot = emptyList()
         callback?.invoke()
     }
 

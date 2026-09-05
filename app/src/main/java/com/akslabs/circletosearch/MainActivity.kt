@@ -407,7 +407,7 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
             
             ListItem(
                 headlineContent = { Text("OCR Language Settings") },
-                supportingContent = { Text("Import custom Tesseract OCR models") },
+                supportingContent = { Text("View bundled offline PaddleOCR models") },
                 trailingContent = { Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp)) },
                 modifier = Modifier.clickable(onClick = onOcrSettingsClick),
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent)

@@ -30,6 +30,7 @@
         tools:ignore="QueryAllPackagesPermission" />
 
     <application
+        android:name=".CircleToSearchApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -40,6 +41,12 @@
         android:theme="@style/Theme.CircleToSearch"
         android:enableOnBackInvokedCallback="true"
         tools:targetApi="31">
+        <!-- ONNX Runtime's bundled initializer enables telemetry before app code runs. OCR is
+             strictly on-device, so initialization is owned by PaddleOcrEngine instead. -->
+        <provider
+            android:name="ai.onnxruntime.TelemetryInitializer"
+            tools:node="remove" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

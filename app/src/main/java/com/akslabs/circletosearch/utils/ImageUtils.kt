@@ -27,23 +27,9 @@ import java.io.File
 import java.io.FileOutputStream
 
 object ImageUtils {
-    private const val SCREENSHOT_FILENAME = "screenshot.png"
-
-    fun saveBitmap(context: Context, bitmap: Bitmap, fileName: String = SCREENSHOT_FILENAME): String {
-        val file = File(context.cacheDir, fileName)
-        try {
-            writePng(bitmap, file)
-        } catch (error: Throwable) {
-            file.delete()
-            throw error
-        }
-        return file.absolutePath
-    }
-
     /**
-     * Saves an image intended for an external share target. Unlike
-     * [saveBitmap], these files are placed in a bounded, app-owned cache so
-     * repeated shares cannot grow cache usage without limit.
+     * Saves each externally shared image under a unique name so an existing URI
+     * never changes its content. Files participate in the transient share-cache cleanup.
      */
     fun saveShareBitmap(context: Context, bitmap: Bitmap, prefix: String): String {
         return StorageUtils.writeTransientShareImage(context, prefix) { file ->

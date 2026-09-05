@@ -44,6 +44,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import android.widget.Toast
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
@@ -77,6 +78,7 @@ class OverlayActivity : ComponentActivity() {
     private val isTranslating = androidx.compose.runtime.mutableStateOf(false)
     private val screenshotBitmap = androidx.compose.runtime.mutableStateOf<android.graphics.Bitmap?>(null)
     private var translationJob: Job? = null
+    private var translationTextCoordinator = ScreenTranslationTextCoordinator()
     private var pendingAssistantLease: AssistantInvocationGate.Lease? = null
     private var windowMadeNonOccluding = false
     private var screenshotCaptureId = BitmapRepository.NO_CAPTURE_ID
@@ -143,7 +145,23 @@ class OverlayActivity : ComponentActivity() {
                             onTranslate = { 
                                 val targetLang = UIPreferences(this@OverlayActivity).getTargetTranslateLang()
                                 translateCurrentScreen(targetLang)
-                            }
+                            },
+                            onTextAnalysisUpdate = { source, nodes, analysisComplete ->
+                                if (source === screenshotBitmap.value) {
+                                    translationTextCoordinator.publish(
+                                        nodes = nodes.map { node ->
+                                            ScreenTranslationNode(
+                                                text = node.fullText,
+                                                left = node.bounds.left,
+                                                top = node.bounds.top,
+                                                right = node.bounds.right,
+                                                bottom = node.bounds.bottom,
+                                            )
+                                        },
+                                        analysisComplete = analysisComplete,
+                                    )
+                                }
+                            },
                         )
                         
                         if (isTranslating.value) {
@@ -356,10 +374,14 @@ class OverlayActivity : ComponentActivity() {
         translationJob = lifecycleScope.launch {
             var translatedBitmap: android.graphics.Bitmap? = null
             try {
-                val recognizedNodes = copyTextManager.value
-                    ?.getTranslationTextSnapshot()
-                    .orEmpty()
-                val outcome = ScreenTranslator().use { translator ->
+                val ocrWaitStartedAt = SystemClock.elapsedRealtime()
+                val recognizedNodes = translationTextCoordinator.awaitSnapshot()
+                android.util.Log.d(
+                    "OverlayActivity",
+                    "Translation waited ${SystemClock.elapsedRealtime() - ocrWaitStartedAt}ms " +
+                        "for shared OCR; nodes=${recognizedNodes.size}",
+                )
+                val outcome = ScreenTranslator(applicationContext).use { translator ->
                     translator.translateScreen(
                         screenshot = currentBitmap,
                         textNodes = recognizedNodes,
@@ -376,16 +398,10 @@ class OverlayActivity : ComponentActivity() {
                         ) {
                             Toast.makeText(
                                 this@OverlayActivity,
-                                when (outcome.reason) {
-                                    ScreenTranslationUnchangedReason.NO_RECOGNIZED_TEXT ->
-                                        "No text found to translate"
-                                    ScreenTranslationUnchangedReason.NO_TRANSLATABLE_TEXT ->
-                                        "The visible text is already in the target language"
-                                },
+                                outcome.reason.userMessage(),
                                 Toast.LENGTH_SHORT,
                             ).show()
                         }
-                        isTranslating.value = false
                         return@launch
                     }
                     is ScreenTranslationOutcome.Translated -> {
@@ -396,7 +412,6 @@ class OverlayActivity : ComponentActivity() {
                 if (!isActive || screenshotBitmap.value !== currentBitmap || isFinishing || isDestroyed) {
                     translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
                     translatedBitmap = null
-                    isTranslating.value = false
                     return@launch
                 }
 
@@ -404,7 +419,6 @@ class OverlayActivity : ComponentActivity() {
                 if (!BitmapRepository.compareAndSetScreenshot(currentBitmap, completedBitmap)) {
                     completedBitmap.takeUnless { it.isRecycled }?.recycle()
                     translatedBitmap = null
-                    isTranslating.value = false
                     return@launch
                 }
 
@@ -415,7 +429,9 @@ class OverlayActivity : ComponentActivity() {
                 screenshotBitmap.value = completedBitmap
                 replaceCopyTextManager(completedBitmap)
                 translatedBitmap = null
-                isTranslating.value = false
+                outcome.userMessage()?.let { message ->
+                    Toast.makeText(this@OverlayActivity, message, Toast.LENGTH_LONG).show()
+                }
             } catch (error: CancellationException) {
                 translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
                 throw error
@@ -423,9 +439,9 @@ class OverlayActivity : ComponentActivity() {
                 translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
                 android.util.Log.e("OverlayActivity", "Translation failed", e)
                 Toast.makeText(this@OverlayActivity, e.message ?: "Translation failed", Toast.LENGTH_LONG).show()
-                isTranslating.value = false
             } finally {
                 if (translationJob === coroutineContext[Job]) {
+                    isTranslating.value = false
                     translationJob = null
                 }
             }
@@ -495,6 +511,8 @@ class OverlayActivity : ComponentActivity() {
     }
 
     private fun replaceCopyTextManager(bitmap: android.graphics.Bitmap?) {
+        translationTextCoordinator.cancel()
+        translationTextCoordinator = ScreenTranslationTextCoordinator()
         copyTextManager.value?.disposeSilently()
         copyTextManager.value = CopyTextOverlayManager(
             context = this,
@@ -508,6 +526,8 @@ class OverlayActivity : ComponentActivity() {
         pendingAssistantLease = null
         translationJob?.cancel()
         translationJob = null
+        translationTextCoordinator.cancel()
+        isTranslating.value = false
         CircleToSearchAccessibilityService.setCopyTextManager(null)
         copyTextManager.value?.disposeSilently()
         copyTextManager.value = null
