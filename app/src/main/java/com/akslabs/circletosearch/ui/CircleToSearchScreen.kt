@@ -1227,9 +1227,14 @@ fun CircleToSearchScreen(
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                allowFileAccess = true
-                allowContentAccess = true
-                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                // Search pages use remote URLs; local image handoff happens outside WebView.
+                allowFileAccess = false
+                allowContentAccess = false
+                @Suppress("DEPRECATION")
+                setAllowFileAccessFromFileURLs(false)
+                @Suppress("DEPRECATION")
+                setAllowUniversalAccessFromFileURLs(false)
+                mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 
                 // Caching for Speed
                 cacheMode = WebSettings.LOAD_DEFAULT // Was LOAD_CACHE_ELSE_NETWORK - caused refresh issues
@@ -1257,8 +1262,8 @@ fun CircleToSearchScreen(
             isVerticalScrollBarEnabled = false
             isHorizontalScrollBarEnabled = false
 
-            // Enable Third-Party Cookies
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            // Keep normal site cookies, without cross-site cookies in embedded search pages.
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
 
             webViewClient = object : WebViewClient() {
                 
