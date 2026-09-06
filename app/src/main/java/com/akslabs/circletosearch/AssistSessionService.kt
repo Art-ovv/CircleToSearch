@@ -41,6 +41,7 @@ private const val SYSTEM_SCREENSHOT_GRACE_MS = 250L
 private const val ACCESSIBILITY_RETRY_DELAY_MS = 400L
 private const val OVERLAY_LAUNCH_ACK_TIMEOUT_MS = 900L
 private const val ASSIST_DELIVERY_GRACE_MS = 600L
+private const val ASSIST_ANALYSIS_TIMEOUT_MS = 5_000L
 
 internal fun shouldFinishUnshownAssistantSession(
     expectedInvocationId: Long,
@@ -82,6 +83,8 @@ class AssistSessionService : VoiceInteractionSessionService() {
         private var shown = false
         private var assistExpected = false
         private var assistComplete = true
+        private var assistAnalysisGeneration = 0L
+        private var assistAnalysisDeadline = 0L
         private var overlayLaunched = false
         private var captureTimeoutInvocationId: Long? = null
         private var captureWatchdogGeneration = 0L
@@ -310,6 +313,8 @@ class AssistSessionService : VoiceInteractionSessionService() {
             val width = coordinateBounds?.width() ?: metrics.widthPixels
             val height = coordinateBounds?.height() ?: metrics.heightPixels
             assistComplete = false
+            assistAnalysisGeneration++
+            assistAnalysisDeadline = android.os.SystemClock.uptimeMillis() + ASSIST_ANALYSIS_TIMEOUT_MS
             assistAnalysis.start(
                 readNodes = { readAssistTextNodes(structure) },
                 onComplete = { result ->
@@ -331,6 +336,7 @@ class AssistSessionService : VoiceInteractionSessionService() {
                     }
                 },
             )
+            if (overlayLaunched) finishAfterAssistDelivery(invocationId)
         }
 
         override fun onHandleScreenshot(screenshot: android.graphics.Bitmap?) {
@@ -446,6 +452,19 @@ class AssistSessionService : VoiceInteractionSessionService() {
                 return
             }
 
+            if (assistAnalysis.isRunning) {
+                val generation = assistAnalysisGeneration
+                // Bound processing separately from waiting for the framework callback.
+                val remaining = (assistAnalysisDeadline - android.os.SystemClock.uptimeMillis())
+                    .coerceAtLeast(0L)
+                mainHandler.postDelayed({
+                    if (!destroyed && activeInvocationId == invocationId &&
+                        assistAnalysisGeneration == generation && overlayLaunched
+                    ) finishSession(invocationId)
+                }, remaining)
+                return
+            }
+
             // Screenshot delivery often wins the race by a few frames. Keep the
             // session alive briefly so its semantic AssistStructure can enrich
             // OCR, but retain the bounded finish that prevents a stale assistant
@@ -454,7 +473,7 @@ class AssistSessionService : VoiceInteractionSessionService() {
                 if (
                     !destroyed &&
                     activeInvocationId == invocationId &&
-                    overlayLaunched
+                    overlayLaunched && !assistAnalysis.isRunning
                 ) {
                     finishSession(invocationId)
                 }

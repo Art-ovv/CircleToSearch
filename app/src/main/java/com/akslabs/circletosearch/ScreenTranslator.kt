@@ -3,6 +3,7 @@ package com.akslabs.circletosearch
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
+import com.akslabs.circletosearch.ui.components.TextNode
 import android.util.Log
 import android.os.SystemClock
 import com.akslabs.circletosearch.ocr.PaddleOcrEngine
@@ -31,8 +32,8 @@ private const val TAG = "ScreenTranslator"
 private const val SCREEN_TRANSLATION_OCR_TIMEOUT_MS = 25_000L
 private const val MAX_PARALLEL_TRANSLATION_REQUESTS = 4
 
-data class TextBlockData(val text: String, val boundingBox: Rect)
-data class TranslatedBlockData(val translatedText: String, val boundingBox: Rect)
+data class TextBlockData(val text: String, val boundingBox: Rect, val sourceNode: TextNode? = null)
+data class TranslatedBlockData(val translatedText: String, val boundingBox: Rect, val sourceIndex: Int = -1)
 
 enum class ScreenTranslationUnchangedReason {
     NO_RECOGNIZED_TEXT,
@@ -59,6 +60,7 @@ sealed interface ScreenTranslationOutcome {
     data class Translated(
         val bitmap: Bitmap,
         val translatedBlockCount: Int,
+        val textNodes: List<TextNode> = emptyList(),
         val untranslatedReasons: Set<ScreenTranslationUnchangedReason> = emptySet(),
     ) : ScreenTranslationOutcome
 }
@@ -70,6 +72,7 @@ internal data class ScreenTranslationNode(
     val top: Int,
     val right: Int,
     val bottom: Int,
+    val sourceNode: TextNode? = null,
 )
 
 class ScreenTranslator(context: Context) : Closeable {
@@ -157,6 +160,7 @@ class ScreenTranslator(context: Context) : Closeable {
                 val rendered = renderScreenTranslations(
                     screenshot = screenshot,
                     translatedBlocks = translatedBlocks,
+                    originalBlocks = textBlocks,
                 ).also { undeliveredBitmap = it.bitmap }
                 if (rendered.renderedBlockCount == 0) {
                     rendered.bitmap.recycle()
@@ -178,6 +182,7 @@ class ScreenTranslator(context: Context) : Closeable {
                 ScreenTranslationOutcome.Translated(
                     bitmap = rendered.bitmap,
                     translatedBlockCount = rendered.renderedBlockCount,
+                    textNodes = rendered.textNodes,
                     untranslatedReasons = translation.issues + if (rendered.unfittedBlockCount > 0) {
                         setOf(ScreenTranslationUnchangedReason.TEXT_DOES_NOT_FIT)
                     } else {
@@ -227,7 +232,7 @@ class ScreenTranslator(context: Context) : Closeable {
             if (!clampedBounds.intersect(bitmapBounds) || clampedBounds.isEmpty) {
                 return@mapNotNull null
             }
-            TextBlockData(text = text, boundingBox = clampedBounds)
+            TextBlockData(text = text, boundingBox = clampedBounds, sourceNode = node.sourceNode)
         }.distinctBy { block ->
             TextBlockKey(
                 text = block.text,
@@ -247,7 +252,7 @@ class ScreenTranslator(context: Context) : Closeable {
                 includeQrCodes = false,
             ).textNodes
         }.map { node ->
-            TextBlockData(node.fullText, Rect(node.bounds))
+            TextBlockData(node.fullText, Rect(node.bounds), node)
         }
     }
 
@@ -421,7 +426,7 @@ class ScreenTranslator(context: Context) : Closeable {
         return LanguageGroupResult(
             blocks = result.translations.map { translated ->
                 val index = blockIndexes[translated.index]
-                IndexedTranslatedBlock(index, TranslatedBlockData(translated.text, blocks[index].boundingBox))
+                IndexedTranslatedBlock(index, TranslatedBlockData(translated.text, blocks[index].boundingBox, index))
             },
             issues = result.issues,
         )

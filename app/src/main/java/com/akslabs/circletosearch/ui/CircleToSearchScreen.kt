@@ -296,6 +296,7 @@ private fun copyDetectedCode(
 @Composable
 fun CircleToSearchScreen(
     screenshot: Bitmap?,
+    preparedTextNodes: List<com.akslabs.circletosearch.ui.components.TextNode>? = null,
     onClose: () -> Unit,
     searchModeOverride: Boolean? = null,
     assistToken: String? = null,
@@ -1104,6 +1105,18 @@ fun CircleToSearchScreen(
             detectedTextEntities = emptyList()
             ocrTextNodes = emptyList()
             isAnalyzingText = false
+            return@LaunchedEffect
+        }
+
+        if (preparedTextNodes != null) {
+            ocrTextNodes = preparedTextNodes
+            detectedTextEntities = withContext(Dispatchers.Default) {
+                com.akslabs.circletosearch.ocr.PaddleOcrEngine.extractSmartEntities(preparedTextNodes)
+            }
+            fullTextScanRunning.set(false)
+            isAnalyzingText = false
+            isTextAnalysisComplete = true
+            textPipelineReadyForQr = true
             return@LaunchedEffect
         }
 

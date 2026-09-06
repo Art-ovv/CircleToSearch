@@ -77,6 +77,9 @@ class OverlayActivity : ComponentActivity() {
     private val assistToken = androidx.compose.runtime.mutableStateOf<String?>(null)
     private val isTranslating = androidx.compose.runtime.mutableStateOf(false)
     private val screenshotBitmap = androidx.compose.runtime.mutableStateOf<android.graphics.Bitmap?>(null)
+    private val translatedTextSnapshot = androidx.compose.runtime.mutableStateOf<
+        Pair<android.graphics.Bitmap, List<com.akslabs.circletosearch.ui.components.TextNode>>?
+    >(null)
     private var translationJob: Job? = null
     private var translationTextCoordinator = ScreenTranslationTextCoordinator()
     private var pendingAssistantLease: AssistantInvocationGate.Lease? = null
@@ -125,6 +128,8 @@ class OverlayActivity : ComponentActivity() {
                     Box(modifier = Modifier.fillMaxSize()) {
                         CircleToSearchScreen(
                             screenshot = screenshotBitmap.value,
+                            preparedTextNodes = translatedTextSnapshot.value
+                                ?.takeIf { it.first === screenshotBitmap.value }?.second,
                             searchModeOverride = searchModeOverride.value,
                             assistToken = assistToken.value,
                             onClose = { 
@@ -156,6 +161,7 @@ class OverlayActivity : ComponentActivity() {
                                                 top = node.bounds.top,
                                                 right = node.bounds.right,
                                                 bottom = node.bounds.bottom,
+                                                sourceNode = node,
                                             )
                                         },
                                         analysisComplete = analysisComplete,
@@ -233,6 +239,7 @@ class OverlayActivity : ComponentActivity() {
         restoreInteractiveWindow()
         setIntent(intent)
 
+        translatedTextSnapshot.value = null
         translationJob?.cancel()
         translationJob = null
         isTranslating.value = false
@@ -426,6 +433,7 @@ class OverlayActivity : ComponentActivity() {
                     com.akslabs.circletosearch.data.AssistDataRepository::clear,
                 )
                 assistToken.value = null
+                translatedTextSnapshot.value = completedBitmap to outcome.textNodes
                 screenshotBitmap.value = completedBitmap
                 replaceCopyTextManager(completedBitmap)
                 translatedBitmap = null
@@ -524,6 +532,7 @@ class OverlayActivity : ComponentActivity() {
     override fun onDestroy() {
         contentGeneration++
         pendingAssistantLease = null
+        translatedTextSnapshot.value = null
         translationJob?.cancel()
         translationJob = null
         translationTextCoordinator.cancel()

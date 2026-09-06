@@ -396,7 +396,7 @@ object PaddleOcrEngine {
         append(bounds.bottom)
     }
 
-    private fun extractSmartEntities(textNodes: List<TextNode>): List<SmartEntity> {
+    internal fun extractSmartEntities(textNodes: List<TextNode>): List<SmartEntity> {
         val entities = mutableListOf<SmartEntity>()
         textNodes.forEach { node ->
             val bounds = RectF(node.bounds)

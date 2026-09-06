@@ -25,6 +25,8 @@ internal class AssistAnalysisRunner(
     private var generation = 0L
     private var job: Job? = null
 
+    val isRunning: Boolean get() = job?.isActive == true
+
     fun cancel() {
         generation++
         job?.cancel()

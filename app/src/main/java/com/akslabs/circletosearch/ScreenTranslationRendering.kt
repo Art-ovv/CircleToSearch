@@ -4,6 +4,12 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import com.akslabs.circletosearch.ui.components.TextNode
+import com.akslabs.circletosearch.ui.components.Word
+import kotlin.math.floor
+import kotlin.math.ceil
 import android.graphics.Rect
 import android.text.Layout
 import android.text.StaticLayout
@@ -15,11 +21,13 @@ internal data class RenderedScreenTranslation(
     val bitmap: Bitmap,
     val renderedBlockCount: Int,
     val unfittedBlockCount: Int,
+    val textNodes: List<TextNode>,
 )
 
 internal suspend fun renderScreenTranslations(
     screenshot: Bitmap,
     translatedBlocks: List<TranslatedBlockData>,
+    originalBlocks: List<TextBlockData> = emptyList(),
 ): RenderedScreenTranslation {
     val coroutineContext = currentCoroutineContext()
     coroutineContext.ensureActive()
@@ -28,6 +36,8 @@ internal suspend fun renderScreenTranslations(
         val canvas = Canvas(resultBitmap)
         val backgroundPaint = Paint().apply { style = Paint.Style.FILL }
         var renderedCount = 0
+        val replacements = mutableMapOf<Int, List<TextNode>>()
+        val additionalNodes = mutableListOf<TextNode>()
 
         for (block in translatedBlocks) {
             coroutineContext.ensureActive()
@@ -47,12 +57,46 @@ internal suspend fun renderScreenTranslations(
             } finally {
                 canvas.restore()
             }
+            val nodes = translationLayoutNodes(layout, block.boundingBox)
+            if (block.sourceIndex in originalBlocks.indices) replacements[block.sourceIndex] = nodes
+            else additionalNodes += nodes
             renderedCount++
         }
-        return RenderedScreenTranslation(resultBitmap, renderedCount, translatedBlocks.size - renderedCount)
+        val nodes = originalBlocks.flatMapIndexed { index, block ->
+            replacements[index] ?: listOf(block.sourceNode ?: TextNode(
+                "original-$index", block.text, Rect(block.boundingBox),
+                listOf(Word(block.text, 0, 0, block.text.length, RectF(block.boundingBox))),
+            ))
+        } + additionalNodes
+        return RenderedScreenTranslation(resultBitmap, renderedCount, translatedBlocks.size - renderedCount, nodes)
     } catch (error: Throwable) {
         resultBitmap.takeUnless { it.isRecycled }?.recycle()
         throw error
+    }
+}
+
+/** Uses the same layout and offset as drawing, including wrapping, alignment and bidi. */
+internal fun translationLayoutNodes(layout: StaticLayout, box: Rect): List<TextNode> {
+    val text = layout.text.toString()
+    val offsetY = box.centerY() - layout.height / 2f
+    return (0 until layout.lineCount).mapNotNull { line ->
+        val start = layout.getLineStart(line)
+        val end = layout.getLineEnd(line)
+        val lineText = text.substring(start, end).trimEnd()
+        val words = Regex("\\S+").findAll(lineText).mapIndexed { index, match ->
+            val path = Path()
+            layout.getSelectionPath(start + match.range.first, start + match.range.last + 1, path)
+            val bounds = RectF()
+            path.computeBounds(bounds, true)
+            bounds.offset(box.left.toFloat(), offsetY)
+            Word(match.value, index, match.range.first, match.range.last + 1, bounds)
+        }.toList()
+        if (words.isEmpty()) return@mapNotNull null
+        val bounds = RectF(words.first().bounds)
+        words.drop(1).forEach { bounds.union(it.bounds) }
+        TextNode(java.util.UUID.randomUUID().toString(), lineText,
+            Rect(floor(bounds.left).toInt(), floor(bounds.top).toInt(),
+                ceil(bounds.right).toInt(), ceil(bounds.bottom).toInt()), words)
     }
 }
 

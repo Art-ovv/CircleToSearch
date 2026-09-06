@@ -62,6 +62,33 @@ class AssistTextProcessingTest {
     }
 
     @Test
+    fun runningAnalysisRemainsPendingUntilItsResultIsDelivered() = runBlocking {
+        withTimeout(5000) {
+            val runner = AssistAnalysisRunner(this)
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val delivered = CompletableDeferred<Unit>()
+            runner.start(
+                readNodes = {
+                    entered.complete(Unit)
+                    release.await()
+                    emptyList()
+                },
+                onComplete = {
+                    assertFalse(runner.isRunning)
+                    delivered.complete(Unit)
+                },
+            )
+            entered.await()
+            // The delivery-grace callback must observe in-flight work, not finish the session.
+            assertTrue(runner.isRunning)
+            release.complete(Unit)
+            delivered.await()
+            assertFalse(runner.isRunning)
+        }
+    }
+
+    @Test
     fun replacedNonCooperativeAnalysisCannotPublishLateResult() = runBlocking {
         withTimeout(5000) {
             val runner = AssistAnalysisRunner(this)
@@ -109,6 +136,7 @@ class AssistTextProcessingTest {
             )
             entered.await()
             runner.cancel()
+            assertFalse(runner.isRunning)
             release.complete(Unit)
             coroutineContext.job.children.toList().joinAll()
             assertFalse(delivered)
