@@ -32,7 +32,6 @@ import kotlinx.coroutines.withContext
 import java.lang.ref.WeakReference
 import kotlin.math.ceil
 import kotlin.math.floor
-import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -277,6 +276,11 @@ object PaddleOcrEngine {
             if (points.size < 4) return@mapNotNull null
             val lineBoundsF = points.bounds()
             if (lineBoundsF.width() < 2f || lineBoundsF.height() < 2f) return@mapNotNull null
+            // Preserve the crop's actual min-area rectangle and orientation. Apply clipping
+            // after projection so off-screen corners do not distort individual word positions.
+            val recognitionPoints = result.recognitionBox.points.map { point ->
+                PointF(point.x * scaleX + offsetX, point.y * scaleY + offsetY)
+            }
 
             val matches = Regex("\\S+").findAll(fullText).toList()
             if (matches.isEmpty()) return@mapNotNull null
@@ -296,7 +300,12 @@ object PaddleOcrEngine {
                     index = index,
                     startIndex = match.range.first,
                     endIndex = match.range.last + 1,
-                    bounds = wordBounds(points, startFraction, endFraction),
+                    bounds = wordBounds(recognitionPoints, startFraction, endFraction).apply {
+                        left = left.coerceIn(0f, sourceWidth.toFloat())
+                        right = right.coerceIn(0f, sourceWidth.toFloat())
+                        top = top.coerceIn(0f, sourceHeight.toFloat())
+                        bottom = bottom.coerceIn(0f, sourceHeight.toFloat())
+                    },
                 )
             }
 
@@ -345,32 +354,14 @@ object PaddleOcrEngine {
     }
 
     private fun wordBounds(points: List<PointF>, start: Float, end: Float): RectF {
-        val topLength = points[0].distanceTo(points[1])
-        val bottomLength = points[3].distanceTo(points[2])
-        val leftLength = points[0].distanceTo(points[3])
-        val rightLength = points[1].distanceTo(points[2])
-        val wordPoints = if (topLength + bottomLength >= leftLength + rightLength) {
-            listOf(
-                interpolate(points[0], points[1], start),
-                interpolate(points[0], points[1], end),
-                interpolate(points[3], points[2], end),
-                interpolate(points[3], points[2], start),
-            )
-        } else {
-            listOf(
-                interpolate(points[0], points[3], start),
-                interpolate(points[1], points[2], start),
-                interpolate(points[1], points[2], end),
-                interpolate(points[0], points[3], end),
-            )
-        }
+        val wordPoints = listOf(
+            interpolate(points[0], points[1], start),
+            interpolate(points[0], points[1], end),
+            interpolate(points[3], points[2], end),
+            interpolate(points[3], points[2], start),
+        )
         return wordPoints.bounds()
     }
-
-    private fun PointF.distanceTo(other: PointF): Float = hypot(
-        (x - other.x).toDouble(),
-        (y - other.y).toDouble(),
-    ).toFloat()
 
     private fun interpolate(start: PointF, end: PointF, fraction: Float): PointF = PointF(
         start.x + (end.x - start.x) * fraction,

@@ -130,11 +130,11 @@ class OCREngine(
                 batchSize = batchSize,
                 cancellationCheck = cancellationCheck,
                 createCrop = { index -> QuadTextCrop.crop(srcMat, sortedBoxes[index]) },
-                isUsable = { crop -> crop.rows() > 0 && crop.cols() > 0 },
-                release = { crop -> crop.release() },
+                isUsable = { crop -> crop.image.rows() > 0 && crop.image.cols() > 0 },
+                release = { crop -> crop.image.release() },
             ) { batchCrops, batchBoxIndices ->
                 if (batchCrops.isNotEmpty()) {
-                    val batchResult = recognitionEngine.recognize(batchCrops)
+                    val batchResult = recognitionEngine.recognize(batchCrops.map { it.image })
                     totalRecPreMs += batchResult.preprocessMs
                     totalRecInfMs += batchResult.inferenceMs
                     totalRecPostMs += batchResult.postprocessMs
@@ -153,6 +153,7 @@ class OCREngine(
                                 text = decoded.text,
                                 confidence = decoded.confidence,
                                 textSpans = decoded.spans,
+                                recognitionBox = batchCrops[j].recognitionBox,
                             )
                         }
                     }

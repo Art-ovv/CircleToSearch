@@ -27,4 +27,6 @@ data class OCRResult(
     val confidence: Float,
     val wordBoxes: List<OCRBox>? = null,
     val textSpans: List<OCRTextSpan> = emptyList(),
+    // Source-space corners ordered along the actual recognition crop, including rotation.
+    val recognitionBox: OCRBox = box,
 )

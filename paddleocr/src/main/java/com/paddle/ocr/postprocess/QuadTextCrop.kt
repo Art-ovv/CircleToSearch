@@ -15,6 +15,7 @@
 package com.paddle.ocr.postprocess
 
 import com.paddle.ocr.model.OCRBox
+import android.graphics.PointF
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -26,9 +27,9 @@ import kotlin.math.hypot
 import kotlin.math.max
 
 object QuadTextCrop {
-    private const val VERTICAL_CROP_RATIO = 1.5
+    data class Crop(val image: Mat, val recognitionBox: OCRBox)
 
-    fun crop(src: Mat, box: OCRBox): Mat {
+    fun crop(src: Mat, box: OCRBox): Crop {
         // Align with PaddleX CropByPolys.get_minarea_rect_crop: recompute minAreaRect
         // from the detected quad before perspective transform.
         val rectPoints = box.points.map { Point(it.x.toDouble(), it.y.toDouble()) }
@@ -51,6 +52,10 @@ object QuadTextCrop {
 
         val dstW = max(widthTop, widthBottom).toInt().coerceAtLeast(1)
         val dstH = max(heightLeft, heightRight).toInt().coerceAtLeast(1)
+        val orientation = CropOrientation(dstW, dstH)
+        val recognitionBox = OCRBox(orientation.recognitionCorners(ordered).map {
+            PointF(it.x.toFloat(), it.y.toFloat())
+        })
 
         val srcPts = MatOfPoint2f()
         val dstPts = try {
@@ -96,11 +101,11 @@ object QuadTextCrop {
                 throw failure
             }
 
-            if (dst.rows().toDouble() / dst.cols() >= VERTICAL_CROP_RATIO) {
+            if (orientation.rotatedCounterClockwise) {
                 val rotated = Mat()
                 return try {
                     Core.rotate(dst, rotated, Core.ROTATE_90_COUNTERCLOCKWISE)
-                    rotated
+                    Crop(rotated, recognitionBox)
                 } catch (failure: Throwable) {
                     rotated.release()
                     throw failure
@@ -108,7 +113,7 @@ object QuadTextCrop {
                     dst.release()
                 }
             }
-            return dst
+            return Crop(dst, recognitionBox)
         } finally {
             transform.release()
         }
