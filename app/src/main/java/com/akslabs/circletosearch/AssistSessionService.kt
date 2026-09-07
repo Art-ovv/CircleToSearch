@@ -27,11 +27,14 @@ import android.os.Handler
 import android.os.Looper
 import android.service.voice.VoiceInteractionSession
 import android.service.voice.VoiceInteractionSessionService
-import android.app.assist.AssistStructure
 import android.os.Build
 import android.widget.Toast
 import com.akslabs.circletosearch.data.BitmapRepository
 import com.akslabs.circletosearch.data.AssistDataRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 private const val CAPTURE_FALLBACK_TIMEOUT_MS = 5_000L
 private const val SYSTEM_SCREENSHOT_GRACE_MS = 250L
@@ -68,6 +71,8 @@ class AssistSessionService : VoiceInteractionSessionService() {
 
         private val captureCoordinator = CaptureSessionCoordinator()
         private val mainHandler = Handler(Looper.getMainLooper())
+        private val assistScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        private val assistAnalysis = AssistAnalysisRunner(assistScope)
         private val receivedAssistIndices = mutableSetOf<Int>()
         private var legacyInvocationId = 0L
         private var activeInvocationId: Long? = null
@@ -123,6 +128,8 @@ class AssistSessionService : VoiceInteractionSessionService() {
             }
 
             if (!captureCoordinator.begin(invocationId)) return
+
+            assistAnalysis.cancel()
 
             recyclePendingBitmap()
             activeInvocationId = invocationId
@@ -287,164 +294,43 @@ class AssistSessionService : VoiceInteractionSessionService() {
         }
 
         override fun onHandleAssist(state: AssistState) {
-            if (destroyed) return
-            android.util.Log.d(
-                "AssistSessionService",
-                "onHandleAssist called: index=${state.index}, count=${state.count}, focused=${state.isFocused}",
-            )
-
+            if (destroyed || finishRequested) return
             if (state.index >= 0) receivedAssistIndices += state.index
-            if (state.isFocused) {
-                assistComplete = true
-                activeAssistToken?.let { token ->
-                    processAssistStructure(token, state.assistStructure)
-                }
-                activeInvocationId?.takeIf { overlayLaunched }?.let {
-                    finishAfterAssistDelivery(it)
-                }
-            }
-        }
-
-        private fun processAssistStructure(token: String, structure: AssistStructure?) {
-            if (structure == null) {
-                android.util.Log.w("AssistSessionService", "AssistStructure is null")
-                return
-            }
-
-            val allNodes = mutableListOf<com.akslabs.circletosearch.ui.components.TextNode>()
-            
-            android.util.Log.d("AssistSessionService", "Capturing AssistStructure - Window count: ${structure.windowNodeCount}")
-            
-            // Process windows from TOP to BOTTOM (Reverse order)
-            // This allows us to track occlusion from overlays like BottomSheets.
-            for (i in (structure.windowNodeCount - 1) downTo 0) {
-                val windowNode = structure.getWindowNodeAt(i)
-                if (windowNode.displayId != android.view.Display.DEFAULT_DISPLAY) {
-                    android.util.Log.d("AssistSessionService", "Skipping non-default display window")
-                    continue
-                }
-                val windowOffsetX = windowNode.left
-                val windowOffsetY = windowNode.top
-                
-                // WindowNode does not expose reliable opacity/z-order information.
-                // Retain visible text and spatially deduplicate it after traversal.
-                collectTextNodes(windowNode.rootViewNode, windowOffsetX, windowOffsetY, allNodes)
-            }
-
-            val visualNodes = deduplicateAssistNodes(allNodes)
-            if (visualNodes.isEmpty()) {
-                android.util.Log.w("AssistSessionService", "No text nodes found in assist data")
-            } else {
-                android.util.Log.d("AssistSessionService", "Extracted ${visualNodes.size} visual text nodes")
-            }
-            
+            if (!state.isFocused) return
+            val token = activeAssistToken ?: return
+            val invocationId = activeInvocationId ?: return
+            val structure = state.assistStructure
             val coordinateBounds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 context.getSystemService(android.view.WindowManager::class.java)
-                    ?.maximumWindowMetrics
-                    ?.bounds
+                    ?.maximumWindowMetrics?.bounds
             } else {
                 null
             }
             val metrics = context.resources.displayMetrics
-            if (!AssistDataRepository.publish(
-                    token = token,
-                    nodes = visualNodes,
-                    coordinateWidth = coordinateBounds?.width() ?: metrics.widthPixels,
-                    coordinateHeight = coordinateBounds?.height() ?: metrics.heightPixels,
-                )
-            ) {
-                android.util.Log.w("AssistSessionService", "Discarded stale assist data for $token")
-            }
-        }
-
-        private fun deduplicateAssistNodes(
-            nodes: List<com.akslabs.circletosearch.ui.components.TextNode>,
-        ): List<com.akslabs.circletosearch.ui.components.TextNode> {
-            val accepted = mutableListOf<com.akslabs.circletosearch.ui.components.TextNode>()
-            nodes.sortedBy { node ->
-                (node.bounds.right - node.bounds.left).toLong() *
-                    (node.bounds.bottom - node.bounds.top).toLong()
-            }.forEach { candidate ->
-                val normalizedText = candidate.fullText.trim().replace(Regex("\\s+"), " ")
-                val duplicate = accepted.any { existing ->
-                    if (existing.fullText.trim().replace(Regex("\\s+"), " ") != normalizedText) {
-                        return@any false
+            val width = coordinateBounds?.width() ?: metrics.widthPixels
+            val height = coordinateBounds?.height() ?: metrics.heightPixels
+            assistComplete = false
+            assistAnalysis.start(
+                readNodes = { readAssistTextNodes(structure) },
+                onComplete = { result ->
+                    if (
+                        !destroyed && !finishRequested &&
+                        activeInvocationId == invocationId && activeAssistToken == token
+                    ) {
+                        result.fold(
+                            onSuccess = { nodes ->
+                                AssistDataRepository.publish(token, nodes, width, height)
+                            },
+                            onFailure = {
+                                // Do not log framework exception messages that may include user text.
+                                android.util.Log.w("AssistSessionService", "Assist text analysis failed")
+                            },
+                        )
+                        assistComplete = true
+                        if (overlayLaunched) finishAfterAssistDelivery(invocationId)
                     }
-                    val overlapWidth = (
-                        minOf(existing.bounds.right, candidate.bounds.right) -
-                            maxOf(existing.bounds.left, candidate.bounds.left)
-                        ).coerceAtLeast(0)
-                    val overlapHeight = (
-                        minOf(existing.bounds.bottom, candidate.bounds.bottom) -
-                            maxOf(existing.bounds.top, candidate.bounds.top)
-                        ).coerceAtLeast(0)
-                    val overlapArea = overlapWidth.toLong() * overlapHeight.toLong()
-                    val existingArea = (existing.bounds.right - existing.bounds.left).toLong() *
-                        (existing.bounds.bottom - existing.bounds.top).toLong()
-                    val candidateArea = (candidate.bounds.right - candidate.bounds.left).toLong() *
-                        (candidate.bounds.bottom - candidate.bounds.top).toLong()
-                    overlapArea >= minOf(existingArea, candidateArea) * 0.8
-                }
-                if (!duplicate) accepted += candidate
-            }
-            return accepted
-        }
-
-        private fun collectTextNodes(
-            node: AssistStructure.ViewNode,
-            parentX: Int,
-            parentY: Int,
-            list: MutableList<com.akslabs.circletosearch.ui.components.TextNode>,
-        ) {
-            if (node.transformation != null) return
-
-            val nodeX = parentX + node.left
-            val nodeY = parentY + node.top
-            val nodeRect = android.graphics.Rect(nodeX, nodeY, nodeX + node.width, nodeY + node.height)
-
-            // Visual text is authoritative. Content descriptions and hints describe
-            // semantics (often icons), not pixels, so they must not replace OCR text.
-            val text = node.text?.toString()
-
-            if (!text.isNullOrBlank() && 
-                node.visibility == android.view.View.VISIBLE &&
-                node.width > 0 && node.height > 10) {
-                
-                // Only add if it's within reasonable screen bounds (optional but safer)
-                // Filter out words that are clearly blank
-                val wordStrings = text.split(Regex("\\s+")).filter { it.isNotBlank() }
-                if (wordStrings.isNotEmpty()) {
-                    // AssistStructure does not expose reliable per-word geometry for all
-                    // widgets. Keep one accurate selectable block instead of inventing
-                    // character boxes that break with wrapping, bidi, and proportional text.
-                    val words = listOf(
-                        com.akslabs.circletosearch.ui.components.Word(
-                            text = text,
-                            index = 0,
-                            startIndex = 0,
-                            endIndex = text.length,
-                            bounds = android.graphics.RectF(nodeRect),
-                        )
-                    )
-
-                    list.add(
-                        com.akslabs.circletosearch.ui.components.TextNode(
-                            id = java.util.UUID.randomUUID().toString(),
-                            fullText = text,
-                            bounds = nodeRect,
-                            words = words
-                        )
-                    )
-                }
-            }
-
-            // Important: For children, subtract current node's scroll position from translated coordinates
-            val nextParentX = nodeX - node.scrollX
-            val nextParentY = nodeY - node.scrollY
-
-            for (i in 0 until node.childCount) {
-                collectTextNodes(node.getChildAt(i), nextParentX, nextParentY, list)
-            }
+                },
+            )
         }
 
         override fun onHandleScreenshot(screenshot: android.graphics.Bitmap?) {
@@ -752,6 +638,8 @@ class AssistSessionService : VoiceInteractionSessionService() {
                 return
             }
             finishRequested = true
+            assistAnalysis.cancel()
+            assistComplete = true
             shown = false
             prepareWatchdogGeneration++
             // VoiceInteractionSession callbacks and every caller of this helper
@@ -843,6 +731,8 @@ class AssistSessionService : VoiceInteractionSessionService() {
 
         override fun onDestroy() {
             destroyed = true
+            assistAnalysis.cancel()
+            assistScope.cancel()
             val leaseToRelease = activeVoiceLease?.takeUnless { overlayLaunched }
             activeInvocationId?.let(captureCoordinator::cancel)
             activeInvocationId = null

@@ -231,7 +231,9 @@ object StorageUtils {
 
     private fun isLegacyShareImage(file: File): Boolean {
         if (!file.isFile || !file.name.endsWith(".png", ignoreCase = true)) return false
-        return file.name.startsWith("selection_") ||
+        // Older Lens searches reused this file outside the managed share directory.
+        return file.name == "screenshot.png" ||
+            file.name.startsWith("selection_") ||
             file.name.startsWith("share_pin_")
     }
 

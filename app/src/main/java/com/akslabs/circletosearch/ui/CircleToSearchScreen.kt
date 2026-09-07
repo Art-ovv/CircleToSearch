@@ -130,6 +130,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.SnapshotStateList
@@ -301,7 +302,12 @@ fun CircleToSearchScreen(
     copyTextManager: com.akslabs.circletosearch.ui.components.CopyTextOverlayManager? = null,
     onCopyText: () -> Unit = {},
     onExitCopyMode: () -> Unit = {},
-    onTranslate: () -> Unit = {}
+    onTranslate: () -> Unit = {},
+    onTextAnalysisUpdate: (
+        Bitmap?,
+        List<com.akslabs.circletosearch.ui.components.TextNode>,
+        Boolean,
+    ) -> Unit = { _, _, _ -> },
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -375,6 +381,7 @@ fun CircleToSearchScreen(
     var detectedQrCodes by remember(screenshot) { mutableStateOf<List<QrResultWithBounds>>(emptyList()) }
     var selectedQrResult by remember(screenshot) { mutableStateOf<QrResultWithBounds?>(null) }
     var isAnalyzingText by remember(screenshot) { mutableStateOf(false) }
+    var isTextAnalysisComplete by remember(screenshot) { mutableStateOf(false) }
     var textPipelineReadyForQr by remember(screenshot) { mutableStateOf(false) }
     var qrRestartGeneration by remember(screenshot) { mutableStateOf(0L) }
     
@@ -410,14 +417,22 @@ fun CircleToSearchScreen(
     var mergedTextNodes by remember(screenshot) {
         mutableStateOf<List<com.akslabs.circletosearch.ui.components.TextNode>>(emptyList())
     }
-    LaunchedEffect(ocrTextNodes, matchingAssistSnapshot, screenshot) {
+    val currentOnTextAnalysisUpdate by rememberUpdatedState(onTextAnalysisUpdate)
+    LaunchedEffect(
+        ocrTextNodes,
+        matchingAssistSnapshot,
+        screenshot,
+        isTextAnalysisComplete,
+        copyTextManager,
+    ) {
         val source = screenshot
         if (source == null) {
             mergedTextNodes = emptyList()
+            currentOnTextAnalysisUpdate(null, emptyList(), false)
         } else {
             val ocrSnapshot = ocrTextNodes
             val assist = matchingAssistSnapshot
-            mergedTextNodes = withContext(Dispatchers.Default) {
+            val mergedNodes = withContext(Dispatchers.Default) {
                 mergeTextNodes(
                     assistNodes = assist?.nodes.orEmpty(),
                     ocrNodes = ocrSnapshot,
@@ -427,10 +442,11 @@ fun CircleToSearchScreen(
                     assistCoordinateHeight = assist?.coordinateHeight ?: source.height,
                 )
             }
+            currentCoroutineContext().ensureActive()
+            mergedTextNodes = mergedNodes
+            copyTextManager?.updateNodes(mergedNodes)
+            currentOnTextAnalysisUpdate(source, mergedNodes, isTextAnalysisComplete)
         }
-    }
-    LaunchedEffect(copyTextManager, mergedTextNodes) {
-        copyTextManager?.updateNodes(mergedTextNodes)
     }
     
 
@@ -752,7 +768,7 @@ fun CircleToSearchScreen(
         if (fullTextScanRunning.get()) {
             // Do not let an early interaction cancel the full-screen primary
             // scan. Run the latest requested ROI immediately after that scan
-            // releases Tesseract's engine.
+            // releases PaddleOCR's serialized inference pipeline.
             pendingSelectionTextRect = requestedViewRect
             isRefiningSelectionText = true
             return
@@ -763,7 +779,7 @@ fun CircleToSearchScreen(
         selectionRuntime.textJob?.cancel()
         val qrJobToAwait = selectionRuntime.qrJob?.takeIf { it.isActive }
         if (qrJobToAwait != null) {
-            // ZXing and Tesseract both allocate large pixel buffers. Stop and
+            // ZXing and PaddleOCR both allocate large pixel buffers. Stop and
             // fully join an active barcode pass before starting interactive OCR;
             // a fresh QR pass is scheduled after this ROI completes.
             qrJobToAwait.cancel()
@@ -777,7 +793,7 @@ fun CircleToSearchScreen(
                 // icon/word from a multi-line selection. Always give an explicit
                 // user region one bounded high-resolution refinement pass.
                 val refinedNodes = withTimeout(REGION_OCR_TIMEOUT_MS) {
-                    com.akslabs.circletosearch.ocr.TesseractEngine
+                    com.akslabs.circletosearch.ocr.PaddleOcrEngine
                         .extractTextInRegion(
                             context = context.applicationContext,
                             bitmap = source,
@@ -1082,6 +1098,7 @@ fun CircleToSearchScreen(
         val source = screenshot
         if (source == null) {
             fullTextScanRunning.set(false)
+            isTextAnalysisComplete = false
             textPipelineReadyForQr = false
             detectedQrCodes = emptyList()
             detectedTextEntities = emptyList()
@@ -1091,30 +1108,19 @@ fun CircleToSearchScreen(
         }
 
         fullTextScanRunning.set(true)
+        isTextAnalysisComplete = false
         textPipelineReadyForQr = false
         isAnalyzingText = true
         detectedQrCodes = emptyList()
         detectedTextEntities = emptyList()
         ocrTextNodes = emptyList()
+        var reachedTerminalState = false
         try {
             val extractionResult = withTimeout(FULL_SCREEN_OCR_TIMEOUT_MS) {
-                com.akslabs.circletosearch.ocr.TesseractEngine.extractText(
+                com.akslabs.circletosearch.ocr.PaddleOcrEngine.extractText(
                     context.applicationContext,
                     source,
                     includeQrCodes = false,
-                    onPrimaryTextNodes = { primaryNodes ->
-                        withContext(Dispatchers.Main.immediate) {
-                            if (scanGeneration.get() == generation) {
-                                ocrTextNodes = primaryNodes
-                                // The primary pass is the visible scan boundary.
-                                // An explicit ROI may supersede only optional
-                                // full-screen enhancement passes after this point.
-                                isAnalyzingText = false
-                                fullTextScanRunning.set(false)
-                                runPendingSelectionRefinement()
-                            }
-                        }
-                    },
                 )
             }
             currentCoroutineContext().ensureActive()
@@ -1122,34 +1128,39 @@ fun CircleToSearchScreen(
                 ocrTextNodes = extractionResult.textNodes
                 detectedTextEntities = extractionResult.smartEntities
             }
+            reachedTerminalState = true
         } catch (error: TimeoutCancellationException) {
+            reachedTerminalState = true
             android.util.Log.w(
                 "CircleToSearch",
                 "Full-screen OCR exceeded ${FULL_SCREEN_OCR_TIMEOUT_MS}ms",
             )
         } catch (error: CancellationException) {
-            // A targeted ROI intentionally supersedes optional post-primary OCR.
-            // Real lifecycle cancellation still propagates here.
-            currentCoroutineContext().ensureActive()
+            throw error
         } catch (error: Exception) {
+            reachedTerminalState = true
             android.util.Log.e("CircleToSearch", "OCR scan failed", error)
         } finally {
-            if (scanGeneration.get() == generation) isAnalyzingText = false
+            if (scanGeneration.get() == generation) {
+                isAnalyzingText = false
+                if (reachedTerminalState) {
+                    isTextAnalysisComplete = true
+                }
+            }
             fullTextScanRunning.set(false)
             if (scanGeneration.get() == generation && screenshot === source) {
                 runPendingSelectionRefinement()
             }
         }
 
-        // Reaching here means all full-screen Tesseract buffers were released,
-        // even when a user ROI superseded the optional enhancement pass.
+        // Reaching here means all full-screen PaddleOCR buffers were released.
         if (scanGeneration.get() == generation && screenshot === source) {
             textPipelineReadyForQr = true
         }
     }
 
     // QR is restartable background enrichment. A later user-requested ROI cancels
-    // and joins this job first, preventing ZXing and Tesseract full-frame buffers
+    // and joins this job first, preventing ZXing and PaddleOCR full-frame buffers
     // from overlapping; this effect then restarts after the ROI becomes stable.
     LaunchedEffect(screenshot, textPipelineReadyForQr, qrRestartGeneration) {
         val source = screenshot
@@ -1408,7 +1419,7 @@ fun CircleToSearchScreen(
                             // Save to cache and launch Lens
                             val path = try {
                                 withContext(Dispatchers.IO) {
-                                    ImageUtils.saveBitmap(context, searchBitmap)
+                                    ImageUtils.saveShareBitmap(context, searchBitmap, prefix = "lens")
                                 }
                             } catch (error: CancellationException) {
                                 throw error
@@ -2054,7 +2065,7 @@ fun CircleToSearchScreen(
                                             scope.launch {
                                                 try {
                                                     val path = withContext(Dispatchers.IO) {
-                                                        ImageUtils.saveBitmap(context, bitmap)
+                                                        ImageUtils.saveShareBitmap(context, bitmap, prefix = "lens")
                                                     }
                                                     val uri = android.net.Uri.fromFile(java.io.File(path))
                                                     val lensResult = searchWithGoogleLens(uri, context)

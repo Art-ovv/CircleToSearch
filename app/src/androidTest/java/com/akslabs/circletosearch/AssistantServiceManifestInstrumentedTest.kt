@@ -28,6 +28,22 @@ import org.xmlpull.v1.XmlPullParser
 @RunWith(AndroidJUnit4::class)
 class AssistantServiceManifestInstrumentedTest {
     @Test
+    fun onnxTelemetryInitializerIsNotRegistered() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val packageInfo = context.packageManager.getPackageInfo(
+            context.packageName,
+            PackageManager.GET_PROVIDERS,
+        )
+
+        assertEquals(CircleToSearchApplication::class.java.name, packageInfo.applicationInfo?.className)
+        assertFalse(
+            packageInfo.providers.orEmpty().any {
+                it.name == "ai.onnxruntime.TelemetryInitializer"
+            },
+        )
+    }
+
+    @Test
     fun voiceServiceComponentAlsoResolvesProtectedAssistFallback() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val packageManager = context.packageManager
