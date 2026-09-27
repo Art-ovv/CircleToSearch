@@ -23,6 +23,7 @@ import com.paddle.ocr.model.OCRError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import java.io.File
 import java.nio.FloatBuffer
 import java.util.concurrent.locks.ReentrantLock
 
@@ -39,6 +40,14 @@ class ORTSessionManager(
         private set
 
     fun loadModels(detAssetPath: String, recAssetPath: String) {
+        loadModels(detAssetPath = detAssetPath, recAssetPath = recAssetPath, recModelFile = null)
+    }
+
+    fun loadModels(
+        detAssetPath: String,
+        recAssetPath: String? = null,
+        recModelFile: File? = null,
+    ) {
         val loadStart = android.os.SystemClock.elapsedRealtime()
         env = try {
             OrtEnvironment.getEnvironment().also { it.setTelemetry(false) }
@@ -56,10 +65,15 @@ class ORTSessionManager(
                 throw OCRError.ModelLoadFailed("detection", error)
             }
             try {
-                recSession = createSessionFromAsset(ortEnv, opts, recAssetPath)
+                recSession = when {
+                    recModelFile != null -> createSessionFromFile(ortEnv, opts, recModelFile)
+                    recAssetPath != null -> createSessionFromAsset(ortEnv, opts, recAssetPath)
+                    else -> throw IllegalArgumentException("No recognition model specified")
+                }
             } catch (error: Exception) {
                 detSession?.close()
                 detSession = null
+                if (error is OCRError) throw error
                 throw OCRError.ModelLoadFailed("recognition", error)
             }
 
@@ -124,6 +138,21 @@ class ORTSessionManager(
     ): OrtSession {
         val modelBytes = readModelAsset(assetPath)
         return ortEnv.createSession(modelBytes, options)
+    }
+
+    private fun createSessionFromFile(
+        ortEnv: OrtEnvironment,
+        options: OrtSession.SessionOptions,
+        file: File,
+    ): OrtSession {
+        if (!file.exists() || !file.isFile) {
+            throw OCRError.ModelNotFound(file.absolutePath, java.io.FileNotFoundException("Model file not found: ${file.absolutePath}"))
+        }
+        return try {
+            ortEnv.createSession(file.absolutePath, options)
+        } catch (error: Exception) {
+            throw OCRError.ModelLoadFailed("recognition", error)
+        }
     }
 
     private suspend fun runSession(

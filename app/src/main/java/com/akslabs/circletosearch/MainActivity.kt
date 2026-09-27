@@ -406,8 +406,8 @@ fun SetupScreen(onSettingsClick: () -> Unit, onOcrSettingsClick: () -> Unit) {
             }
             
             ListItem(
-                headlineContent = { Text("OCR Language Settings") },
-                supportingContent = { Text("View bundled offline PaddleOCR models") },
+                headlineContent = { Text("Download languages") },
+                supportingContent = { Text("Add or remove languages for text recognition") },
                 trailingContent = { Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp)) },
                 modifier = Modifier.clickable(onClick = onOcrSettingsClick),
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent)

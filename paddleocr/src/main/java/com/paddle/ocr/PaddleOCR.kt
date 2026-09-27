@@ -70,6 +70,27 @@ class PaddleOCR private constructor(
             }
         }
 
+        suspend fun create(
+            context: Context,
+            config: PaddleOCRConfig,
+            engineConfig: EngineConfig,
+            detModelAssetPath: String,
+            recModelFile: java.io.File,
+            recConfigFile: java.io.File,
+        ): PaddleOCR {
+            val appContext = context.applicationContext
+            return createSafely {
+                OCREngine(
+                    appContext, config, engineConfig,
+                    detModelAsset = detModelAssetPath,
+                    recModelAsset = null,
+                    recConfigAsset = null,
+                    recModelFile = recModelFile,
+                    recConfigFile = recConfigFile,
+                )
+            }
+        }
+
         private suspend fun createSafely(createEngine: () -> OCREngine): PaddleOCR {
             val undeliveredEngine = AtomicReference<OCREngine?>(null)
             var primaryFailure: Throwable? = null

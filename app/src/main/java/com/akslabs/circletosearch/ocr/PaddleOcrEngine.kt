@@ -23,6 +23,7 @@ import com.paddle.ocr.model.OCRError
 import com.paddle.ocr.util.OpenCVUtils
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.lastOrNull
@@ -55,6 +56,7 @@ object PaddleOcrEngine {
 
     private val engineMutex = Mutex()
     private var cachedEngine: PaddleOCR? = null
+    private var cachedPackId: String? = null
     private var cachedBitmap = WeakReference<Bitmap>(null)
     private var cachedTextNodes: List<TextNode>? = null
 
@@ -69,18 +71,48 @@ object PaddleOcrEngine {
 
     suspend fun warmUp(context: Context) {
         val appContext = context.applicationContext
+        OcrLanguageManager.prepareRuntime(appContext)
         engineMutex.withLock {
-            ensureEngine(appContext)
+            val activePack = OcrLanguageManager.getActivePack(appContext)
+            ensureEngine(appContext, activePack)
         }
         Log.d(TAG, "PaddleOCR warm-up complete")
     }
 
+    /**
+     * Executes a state mutation under [engineMutex] on [Dispatchers.IO], ensuring inference
+     * and pack mutations cannot interleave.
+     */
+    suspend fun <T> executeMutation(block: suspend () -> T): T {
+        return engineMutex.withLock {
+            withContext(Dispatchers.IO) {
+                block()
+            }
+        }
+    }
+
+    /**
+     * Detaches and releases the currently cached engine session.
+     * Guaranteed to release using NonCancellable + Dispatchers.IO.
+     *
+     * MUST be called only while [engineMutex] is held (e.g. inside [executeMutation] or private engine lock blocks).
+     */
+    internal suspend fun detachAndReleaseEngine() {
+        check(engineMutex.isLocked) { "detachAndReleaseEngine requires engineMutex to be held" }
+        val engine = cachedEngine
+        cachedEngine = null
+        cachedPackId = null
+        clearTextCache()
+        if (engine != null) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                engine.release()
+            }
+        }
+    }
+
     suspend fun releaseCachedEngine() {
         engineMutex.withLock {
-            val engine = cachedEngine
-            cachedEngine = null
-            clearTextCache()
-            engine?.release()
+            detachAndReleaseEngine()
         }
     }
 
@@ -132,6 +164,9 @@ object PaddleOcrEngine {
         require(!bitmap.isRecycled) { "Cannot run OCR on a recycled bitmap" }
         if (!sourceRegion.isFinite()) return@withContext emptyList()
 
+        val appContext = context.applicationContext
+        OcrLanguageManager.prepareRuntime(appContext)
+
         val clipped = Rect(
             floor(sourceRegion.left.toDouble()).toInt().coerceIn(0, bitmap.width),
             floor(sourceRegion.top.toDouble()).toInt().coerceIn(0, bitmap.height),
@@ -160,7 +195,12 @@ object PaddleOcrEngine {
                 Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
             )
             engineMutex.withLock {
-                val runResult = recognizeLocked(context.applicationContext, targetedBitmap)
+                val activePack = OcrLanguageManager.getActivePack(appContext)
+                val activePackId = activePack.id
+                if (cachedPackId != null && cachedPackId != activePackId) {
+                    detachAndReleaseEngine()
+                }
+                val runResult = recognizeLocked(appContext, targetedBitmap, activePack)
                 logTiming("region", runResult.totalTimeMs, runResult.lineCount)
                 mapResultsToTextNodes(
                     results = runResult.results,
@@ -180,42 +220,79 @@ object PaddleOcrEngine {
     private suspend fun recognizeFullScreen(
         context: Context,
         bitmap: Bitmap,
-    ): List<TextNode> = engineMutex.withLock {
-        if (cachedBitmap.get() === bitmap) {
-            cachedTextNodes?.let { return@withLock it }
-        }
+    ): List<TextNode> {
+        val appContext = context.applicationContext
+        OcrLanguageManager.prepareRuntime(appContext)
+        return engineMutex.withLock {
+            val activePack = OcrLanguageManager.getActivePack(appContext)
+            val activePackId = activePack.id
+            if (cachedPackId != null && cachedPackId != activePackId) {
+                detachAndReleaseEngine()
+            }
+            if (cachedBitmap.get() === bitmap && cachedPackId == activePackId && cachedEngine != null) {
+                cachedTextNodes?.let { return@withLock it }
+            }
 
-        val runResult = recognizeLocked(context, bitmap)
-        logTiming("full", runResult.totalTimeMs, runResult.lineCount)
-        val nodes = withContext(Dispatchers.Default) {
-            mapResultsToTextNodes(
-                results = runResult.results,
-                sourceWidth = bitmap.width,
-                sourceHeight = bitmap.height,
+            val runResult = recognizeLocked(appContext, bitmap, activePack)
+            logTiming("full", runResult.totalTimeMs, runResult.lineCount)
+            val nodes = withContext(Dispatchers.Default) {
+                mapResultsToTextNodes(
+                    results = runResult.results,
+                    sourceWidth = bitmap.width,
+                    sourceHeight = bitmap.height,
+                )
+            }
+            cachedBitmap = WeakReference(bitmap)
+            cachedTextNodes = nodes
+            nodes
+        }
+    }
+
+    /** Must be called while [engineMutex] is held. */
+    private suspend fun ensureEngine(context: Context, activePack: OcrLanguagePack): PaddleOCR {
+        if (cachedEngine != null && cachedPackId == activePack.id) {
+            return cachedEngine!!
+        }
+        if (cachedEngine != null) {
+            detachAndReleaseEngine()
+        }
+        check(OpenCVUtils.init(context)) { "Unable to initialize OpenCV for PaddleOCR" }
+        val engine = if (activePack.isBundled) {
+            PaddleOCR.create(
+                context = context,
+                config = paddleConfig,
+                engineConfig = EngineConfig(numThreads = 4),
+                detModelAssetPath = DET_MODEL_ASSET,
+                recModelAssetPath = REC_MODEL_ASSET,
+                recConfigAssetPath = REC_CONFIG_ASSET,
+            )
+        } else {
+            val baseDir = context.noBackupFilesDir ?: context.filesDir
+            val storage = OcrLanguageStorage(java.io.File(baseDir, "ocr_models"))
+            val installedFiles = storage.getInstalledModelFiles(activePack.id)
+                ?: throw java.io.FileNotFoundException("Installed model files missing for pack ${activePack.displayName}")
+
+            PaddleOCR.create(
+                context = context,
+                config = paddleConfig,
+                engineConfig = EngineConfig(numThreads = 4),
+                detModelAssetPath = DET_MODEL_ASSET,
+                recModelFile = installedFiles.modelFile,
+                recConfigFile = installedFiles.configFile,
             )
         }
-        cachedBitmap = WeakReference(bitmap)
-        cachedTextNodes = nodes
-        nodes
+        cachedEngine = engine
+        cachedPackId = activePack.id
+        return engine
     }
 
     /** Must be called while [engineMutex] is held. */
-    private suspend fun ensureEngine(context: Context): PaddleOCR {
-        cachedEngine?.let { return it }
-        check(OpenCVUtils.init(context)) { "Unable to initialize OpenCV for PaddleOCR" }
-        return PaddleOCR.create(
-            context = context,
-            config = paddleConfig,
-            engineConfig = EngineConfig(numThreads = 4),
-            detModelAssetPath = DET_MODEL_ASSET,
-            recModelAssetPath = REC_MODEL_ASSET,
-            recConfigAssetPath = REC_CONFIG_ASSET,
-        ).also { cachedEngine = it }
-    }
-
-    /** Must be called while [engineMutex] is held. */
-    private suspend fun recognizeLocked(context: Context, bitmap: Bitmap): OCRRunResult {
-        val engine = ensureEngine(context)
+    private suspend fun recognizeLocked(
+        context: Context,
+        bitmap: Bitmap,
+        activePack: OcrLanguagePack,
+    ): OCRRunResult {
+        val engine = ensureEngine(context, activePack)
         return try {
             engine.recognize(bitmap)
         } catch (error: CancellationException) {
@@ -226,10 +303,8 @@ object PaddleOcrEngine {
         } catch (error: Exception) {
             // An ORT/OpenCV failure may leave a native session unusable. Drop it so a later user
             // request gets one clean reload instead of inheriting the same broken session.
-            if (cachedEngine === engine) cachedEngine = null
-            clearTextCache()
             try {
-                engine.release()
+                detachAndReleaseEngine()
             } catch (releaseError: Exception) {
                 error.addSuppressed(releaseError)
             }

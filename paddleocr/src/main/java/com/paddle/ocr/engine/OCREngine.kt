@@ -27,6 +27,7 @@ import com.paddle.ocr.util.BitmapUtils
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import java.io.File
 import kotlin.math.hypot
 import kotlin.math.max
 
@@ -35,8 +36,10 @@ class OCREngine(
     private val config: PaddleOCRConfig,
     engineConfig: EngineConfig,
     detModelAsset: String = "models/det/inference.onnx",
-    recModelAsset: String = "models/rec/inference.onnx",
-    recConfigAsset: String = "models/rec/inference.yml",
+    recModelAsset: String? = "models/rec/inference.onnx",
+    recConfigAsset: String? = "models/rec/inference.yml",
+    recModelFile: File? = null,
+    recConfigFile: File? = null,
 ) {
     private val ortManager = ORTSessionManager(context, engineConfig)
     private val detectionEngine: DetectionEngine
@@ -45,8 +48,16 @@ class OCREngine(
 
     init {
         val configured = try {
-            ortManager.loadModels(detModelAsset, recModelAsset)
-            val recModelConfig = ModelConfig.parse(context, recConfigAsset)
+            ortManager.loadModels(
+                detAssetPath = detModelAsset,
+                recAssetPath = recModelAsset,
+                recModelFile = recModelFile,
+            )
+            val recModelConfig = when {
+                recConfigFile != null -> ModelConfig.parse(recConfigFile)
+                recConfigAsset != null -> ModelConfig.parse(context, recConfigAsset)
+                else -> throw OCRError.ConfigParseFailed("No recognition config specified")
+            }
             recModelConfig
         } catch (t: Throwable) {
             ortManager.release()

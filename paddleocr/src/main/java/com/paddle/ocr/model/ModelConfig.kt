@@ -16,6 +16,7 @@ package com.paddle.ocr.model
 
 import android.content.Context
 import com.paddle.ocr.util.YamlUtils
+import java.io.File
 
 data class ModelConfig(
     val characterList: List<String>,
@@ -27,12 +28,25 @@ data class ModelConfig(
             } catch (error: Exception) {
                 throw OCRError.ConfigParseFailed(assetPath, error)
             }
+            return parseContent(content, assetPath)
+        }
+
+        fun parse(file: File): ModelConfig {
+            val content = try {
+                file.bufferedReader().use { it.readText() }
+            } catch (error: Exception) {
+                throw OCRError.ConfigParseFailed(file.absolutePath, error)
+            }
+            return parseContent(content, file.absolutePath)
+        }
+
+        fun parseContent(content: String, sourceName: String): ModelConfig {
             val characterDict = try {
-                extractCharacterDict(content, assetPath)
+                extractCharacterDict(content, sourceName)
             } catch (e: OCRError.ConfigParseFailed) {
                 throw e
             } catch (error: Exception) {
-                throw OCRError.ConfigParseFailed(assetPath, error)
+                throw OCRError.ConfigParseFailed(sourceName, error)
             }
             val charListWithSpace = characterDict.toMutableList().apply {
                 if (lastOrNull() != " ") add(" ")
