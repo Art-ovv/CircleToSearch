@@ -36,8 +36,13 @@ search and downloading on-device language models.
 
 ### OCR and text selection
 
-- Expanded on-device OCR for Russian and English text with mixed-polarity,
-  adaptive-threshold, skew, small-label, low-contrast, and off-centre handling.
+- Replaced Tesseract with bundled, offline PaddleOCR models and corrected the
+  geometry of recognition crops so detected words stay aligned with the image.
+- Added OCR language-pack management in Settings: download, select, and remove
+  recognition models. The bundled East Slavic pack works without a download;
+  additional packs are downloaded on request and then run on-device.
+- Supports Russian and English text, including small labels, mixed contrast,
+  skewed text, and off-centre content.
 - Improved reading order, line grouping, AssistStructure/OCR merging, and
   filtering of icon-like false positives while preserving short identifiers,
   serial numbers, prices, and codes.
@@ -60,21 +65,27 @@ search and downloading on-device language models.
 
 ### Camera photo search
 
-- Added main-screen Camera button launching the installed system camera via
-  `ActivityResultContracts.TakePicture` without requiring app `CAMERA` permissions.
-- Captured photos open directly in the local selection overlay with existing image
-  selection, on-device OCR text copying, screen and per-text translation, QR/barcode
-  scanning, share/save, and explicit external image search.
+- Added a main-screen camera entry point with an in-app CameraX preview. Camera
+  permission is requested when needed.
+- Taking a photo starts a search of the whole image immediately, without a
+  confirmation, selection, or separate web-search tap. The shutter explains
+  that this action sends the photo to Litterbox/Catbox or Google Lens.
+- After the search, the photo remains available in the local selection overlay
+  for image-region actions, OCR text copying, translation, QR/barcode scanning,
+  sharing, and saving.
 - Preserves the entire photo without stretching or cropping by decoding off-thread
   with bounded dimensions, normalizing EXIF orientation via platform `ImageDecoder`,
   and aspect-fitting onto a viewport-proportioned canvas with neutral letterboxing.
-- Resilient against activity recreation, process death, cancellation, missing camera
-  apps, empty output, repeated taps, and stale work, with stable temporary capture paths,
+- Resilient against activity recreation, process death, cancellation, unavailable
+  camera, empty output, repeated taps, and stale work, with stable temporary capture paths,
   completion sidecar markers, and best-effort cleanup of orphaned temporary files
   older than 24 hours (with in-flight captures protected for at least 15 minutes).
 
 ### UI, performance, and storage
 
+- Simplified the screen-capture overlay to three compact actions: search the
+  whole screen image, translate screen text, and open camera search. Tapping
+  empty space still hides the controls without disabling selection.
 - Reworked scan feedback, selection trails, control transitions, and result
   overlays with Compose animations that avoid full-screen recomposition.
 - Coordinated OCR and barcode jobs, bounded stale work, reused OCR engines, and
@@ -148,6 +159,8 @@ install test packages on the selected device:
 - The app does not add analytics, advertising, or background screenshot upload.
 - A selected image region leaves the device only after the user explicitly
   requests an external image-search action.
+- Whole-screen and camera-photo search send the corresponding image to the
+  external search service when the user taps Search or the camera shutter.
 
 ## Credits and license
 
