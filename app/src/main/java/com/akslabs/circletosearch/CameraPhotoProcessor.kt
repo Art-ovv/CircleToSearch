@@ -13,6 +13,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.os.Build
 import androidx.annotation.RequiresApi
+import androidx.annotation.VisibleForTesting
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -29,6 +30,22 @@ object CameraPhotoProcessor {
         viewportWidth: Int,
         viewportHeight: Int,
         maxDimension: Int = CameraPhotoGeometry.DEFAULT_MAX_DIMENSION,
+    ): Bitmap = processPhoto(
+        photoFile = photoFile,
+        viewportWidth = viewportWidth,
+        viewportHeight = viewportHeight,
+        maxDimension = maxDimension,
+        onDecodedSize = { _, _ -> },
+    )
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    @VisibleForTesting
+    internal suspend fun processPhoto(
+        photoFile: File,
+        viewportWidth: Int,
+        viewportHeight: Int,
+        maxDimension: Int,
+        onDecodedSize: (Int, Int) -> Unit,
     ): Bitmap {
         var undeliveredTarget: Bitmap? = null
         return try {
@@ -61,6 +78,7 @@ object CameraPhotoProcessor {
                     }
 
                     currentCoroutineContext().ensureActive()
+                    onDecodedSize(decoded.width, decoded.height)
 
                     val geometry = CameraPhotoGeometry.compute(
                         photoWidth = decoded.width,

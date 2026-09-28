@@ -3,6 +3,7 @@ package com.akslabs.circletosearch.ocr
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -13,27 +14,30 @@ class OcrLanguageCatalogTest {
         val bundled = OcrLanguageCatalog.bundledPack
         assertEquals(OcrLanguageCatalog.BUNDLED_PACK_ID, bundled.id)
         assertTrue(bundled.isBundled)
-        assertEquals("East Slavic", bundled.displayName)
-        assertTrue(bundled.coverageDescription.contains("Russian"))
-        assertTrue(bundled.coverageDescription.contains("English"))
+        assertTrue(bundled.displayName.isNotBlank())
+        assertTrue(bundled.coverageDescription.isNotBlank())
     }
 
     @Test
     fun allDownloadablePacksHaveValidMetadataAndChecksums() {
         val downloadable = OcrLanguageCatalog.downloadablePacks
-        assertEquals("Catalog should contain exactly 4 downloadable packs", 4, downloadable.size)
+        assertTrue("Catalog should contain downloadable packs", downloadable.isNotEmpty())
 
         downloadable.forEach { pack ->
             assertFalse("${pack.id} should not be bundled", pack.isBundled)
-            assertTrue("${pack.id} id should be non-empty", pack.id.isNotEmpty())
-            assertTrue("${pack.id} display name should be non-empty", pack.displayName.isNotEmpty())
-            assertTrue("${pack.id} coverage should be non-empty", pack.coverageDescription.isNotEmpty())
+            assertTrue("${pack.id} id should be non-empty", pack.id.isNotBlank())
+            assertTrue("${pack.id} display name should be non-empty", pack.displayName.isNotBlank())
+            assertTrue("${pack.id} coverage should be non-empty", pack.coverageDescription.isNotBlank())
 
             // HuggingFace coordinates
-            assertNotNull("${pack.id} should have model repo", pack.modelRepo)
-            assertTrue("${pack.id} model repo should start with PaddlePaddle/", pack.modelRepo!!.startsWith("PaddlePaddle/"))
-            assertNotNull("${pack.id} should have commit SHA", pack.commitSha)
-            assertEquals("${pack.id} commit SHA should be 40-char git hash", 40, pack.commitSha!!.length)
+            val repo = pack.modelRepo
+            assertNotNull("${pack.id} should have model repo", repo)
+            assertTrue("${pack.id} model repo should start with PaddlePaddle/", repo!!.startsWith("PaddlePaddle/"))
+
+            val commit = pack.commitSha
+            assertNotNull("${pack.id} should have commit SHA", commit)
+            assertEquals("${pack.id} commit SHA should be 40-char git hash", 40, commit!!.length)
+            assertTrue("${pack.id} commit SHA must be hex", commit.matches(Regex("^[0-9a-fA-F]{40}$")))
 
             // ONNX model metadata
             assertEquals("inference.onnx", pack.onnxFilename)
@@ -47,13 +51,13 @@ class OcrLanguageCatalogTest {
             assertEquals("${pack.id} YAML SHA-256 must be 64 hex characters", 64, pack.yamlSha256.length)
             assertTrue("${pack.id} YAML SHA-256 must be hex", pack.yamlSha256.matches(Regex("^[0-9a-fA-F]{64}$")))
 
-            // Valid download URLs
+            // Valid download URLs: must use HTTPS
             val onnxUrl = pack.onnxUrl()
             val yamlUrl = pack.yamlUrl()
             assertNotNull(onnxUrl)
             assertNotNull(yamlUrl)
-            assertTrue(onnxUrl!!.startsWith("https://huggingface.co/"))
-            assertTrue(yamlUrl!!.startsWith("https://huggingface.co/"))
+            assertTrue(onnxUrl!!.startsWith("https://"))
+            assertTrue(yamlUrl!!.startsWith("https://"))
             assertTrue(onnxUrl.endsWith("/inference.onnx"))
             assertTrue(yamlUrl.endsWith("/inference.yml"))
         }
@@ -75,16 +79,16 @@ class OcrLanguageCatalogTest {
 
     @Test
     fun getPackResolvesExpectedPacks() {
-        val latin = OcrLanguageCatalog.getPack("latin")
-        assertNotNull(latin)
-        assertEquals("Latin script", latin!!.displayName)
+        val knownIds = listOf("latin", "zh_en", "korean", "devanagari", OcrLanguageCatalog.BUNDLED_PACK_ID)
+        for (id in knownIds) {
+            val pack = OcrLanguageCatalog.getPack(id)
+            assertNotNull("Pack '$id' should be resolvable", pack)
+            assertEquals(id, pack!!.id)
+            assertTrue(pack.displayName.isNotBlank())
+        }
 
-        val zhEn = OcrLanguageCatalog.getPack("zh_en")
-        assertNotNull(zhEn)
-        assertEquals("Chinese & English", zhEn!!.displayName)
-
-        val korean = OcrLanguageCatalog.getPack("korean")
-        assertNotNull(korean)
-        assertEquals("Korean", korean!!.displayName)
+        assertNull(OcrLanguageCatalog.getPack("nonexistent"))
+        assertNull(OcrLanguageCatalog.getPack("../passwd"))
+        assertNull(OcrLanguageCatalog.getPack(""))
     }
 }

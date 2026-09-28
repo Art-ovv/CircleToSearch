@@ -158,23 +158,29 @@ class CameraPhotoFileManagerTest {
     }
 
     @Test
-    fun pruneProtectsRecentInFlightFilesFromCountPruning() {
+    fun pruneProtectsRecentCompletedFilesFromCountPruning() {
         val cacheDir = tempFolder.newFolder("cache5")
         val cameraDir = File(cacheDir, "camera_search").apply { mkdirs() }
         val fixedNow = 1_700_000_000_000L
 
-        // File modified 30 seconds ago (in flight / recently written)
-        val inFlightFile = File(cameraDir, "in_flight.jpg").apply {
+        // Both files are marked completed so they are eligible for count-pruning
+        val recentCompletedFile = File(cameraDir, "recent_completed.jpg").apply {
             writeBytes(byteArrayOf(1))
-            setLastModified(fixedNow - 30_000L)
+            setLastModified(fixedNow - 30_000L) // 30 seconds old
         }
-        val oldAbandonedFile = File(cameraDir, "old_abandoned.jpg").apply {
+        CameraPhotoFileManager.markCaptureCompleted(recentCompletedFile)
+        val recentMarker = CameraPhotoFileManager.getCompletionMarkerFile(recentCompletedFile)
+        assertTrue(recentMarker.exists())
+
+        val oldCompletedFile = File(cameraDir, "old_abandoned.jpg").apply {
             writeBytes(byteArrayOf(2))
             setLastModified(fixedNow - 2_000_000L) // 33 minutes old
         }
-        CameraPhotoFileManager.markCaptureCompleted(oldAbandonedFile)
+        CameraPhotoFileManager.markCaptureCompleted(oldCompletedFile)
+        val oldMarker = CameraPhotoFileManager.getCompletionMarkerFile(oldCompletedFile)
+        assertTrue(oldMarker.exists())
 
-        // maxFiles = 0, but maxAge = 24h, minInFlightAgeMs = 15 minutes (900_000 ms)
+        // maxFiles = 0, but minInFlightAgeMs = 15 minutes (900_000 ms) and maxAge = 24h
         CameraPhotoFileManager.pruneDirectory(
             dir = cameraDir,
             preservePaths = emptySet(),
@@ -184,10 +190,13 @@ class CameraPhotoFileManagerTest {
             minInFlightAgeMs = 900_000L,
         )
 
-        // inFlightFile should be protected from count pruning because age < 15 min
-        assertTrue(inFlightFile.exists())
-        // oldAbandonedFile should be deleted because age >= 15 min and maxFiles = 0
-        assertFalse(oldAbandonedFile.exists())
+        // recentCompletedFile is protected from count pruning because age (30s) < minInFlightAgeMs (15m)
+        assertTrue(recentCompletedFile.exists())
+        assertTrue(recentMarker.exists())
+
+        // oldCompletedFile is pruned along with its marker because age (33m) >= minInFlightAgeMs (15m)
+        assertFalse(oldCompletedFile.exists())
+        assertFalse(oldMarker.exists())
     }
 
     @Test
@@ -237,5 +246,21 @@ class CameraPhotoFileManagerTest {
         assertFalse("Old completion sidecar marker should be cleaned alongside photo", oldMarker.exists())
         assertTrue("New completed capture should be retained", newCompletedFile.exists())
         assertTrue("New completion sidecar marker should be retained", newMarker.exists())
+    }
+
+    @Test
+    fun deleteFileSyncRemovesPhotoAndCompletionMarker() {
+        val cacheDir = tempFolder.newFolder("cache_delete")
+        val photoFile = File(cacheDir, "photo.jpg").apply {
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        CameraPhotoFileManager.markCaptureCompleted(photoFile)
+        val marker = CameraPhotoFileManager.getCompletionMarkerFile(photoFile)
+        assertTrue(photoFile.exists())
+        assertTrue(marker.exists())
+
+        CameraPhotoFileManager.deleteFileSync(photoFile.absolutePath)
+        assertFalse(photoFile.exists())
+        assertFalse(marker.exists())
     }
 }

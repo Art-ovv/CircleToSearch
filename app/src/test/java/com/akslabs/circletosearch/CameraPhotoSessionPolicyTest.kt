@@ -14,49 +14,57 @@ import org.junit.Test
 class CameraPhotoSessionPolicyTest {
 
     @Test
-    fun initialSessionStateIsEmptyAndIdle() {
+    fun captureFlowTransitionsThroughPreparingAndInFlightToProcessing() {
         val policy = CameraPhotoSessionPolicy()
+
+        // Phase 1: Initial IDLE state
+        assertEquals(CameraPhotoSessionPolicy.SessionPhase.IDLE, policy.phase)
         assertNull(policy.pendingCaptureFilePath)
         assertNull(policy.activePhotoFilePath)
         assertEquals(0L, policy.currentGeneration)
-        assertEquals(CameraPhotoSessionPolicy.SessionPhase.IDLE, policy.phase)
+        assertTrue(policy.canLaunchCamera(isRestart = false))
+        assertFalse(policy.shouldScheduleViewportDecode())
+        assertNull(policy.getPhotoPathForViewportDecode())
+        assertEquals(CameraPhotoSessionPolicy.RestorationAction.FinishSession, policy.getRestorationAction())
         assertTrue(policy.getFilesToPreserve().isEmpty())
-    }
 
-    @Test
-    fun prepareCaptureSetsPendingPathAndIncrementsGeneration() {
-        val policy = CameraPhotoSessionPolicy()
-        val generation = policy.prepareCapture("/cache/capture1.jpg")
-
+        // Phase 2: PREPARING state upon capture file allocation
+        val capturePath = "/cache/capture1.jpg"
+        val generation = policy.prepareCapture(capturePath)
         assertEquals(1L, generation)
         assertEquals(1L, policy.currentGeneration)
         assertEquals(CameraPhotoSessionPolicy.SessionPhase.PREPARING, policy.phase)
-        assertEquals("/cache/capture1.jpg", policy.pendingCaptureFilePath)
-        assertEquals(setOf("/cache/capture1.jpg"), policy.getFilesToPreserve())
-    }
+        assertEquals(capturePath, policy.pendingCaptureFilePath)
+        assertEquals(setOf(capturePath), policy.getFilesToPreserve())
+        assertFalse("Normal camera launch should be prevented during PREPARING", policy.canLaunchCamera(isRestart = false))
+        assertTrue("Restart should be permitted during PREPARING", policy.canLaunchCamera(isRestart = true))
+        assertEquals(CameraPhotoSessionPolicy.RestorationAction.RelaunchCamera, policy.getRestorationAction())
+        assertFalse(policy.shouldScheduleViewportDecode())
 
-    @Test
-    fun markCameraLaunchedTransitionsToCameraInFlight() {
-        val policy = CameraPhotoSessionPolicy()
-        policy.prepareCapture("/cache/capture1.jpg")
+        // Phase 3: CAMERA_IN_FLIGHT when external camera activity is launched
         policy.markCameraLaunched()
-
         assertEquals(CameraPhotoSessionPolicy.SessionPhase.CAMERA_IN_FLIGHT, policy.phase)
-    }
+        assertFalse("Camera launch cannot proceed while camera is in flight", policy.canLaunchCamera(isRestart = false))
+        assertFalse("Camera restart cannot proceed while camera is in flight", policy.canLaunchCamera(isRestart = true))
+        assertEquals(CameraPhotoSessionPolicy.RestorationAction.WaitForCameraResult, policy.getRestorationAction())
+        assertFalse(policy.shouldScheduleViewportDecode())
+        assertEquals(setOf(capturePath), policy.getFilesToPreserve())
 
-    @Test
-    fun captureSuccessTransitionsToProcessing() {
-        val policy = CameraPhotoSessionPolicy()
-        val generation = policy.prepareCapture("/cache/capture1.jpg")
-        policy.markCameraLaunched()
-
+        // Phase 4: PROCESSING upon successful photo capture result
         val action = policy.onCaptureResult(success = true, fileExistsAndNotEmpty = true)
         assertTrue(action is CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode)
         val proceed = action as CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode
         assertEquals(generation, proceed.generation)
-        assertEquals("/cache/capture1.jpg", proceed.filePath)
+        assertEquals(capturePath, proceed.filePath)
         assertEquals(CameraPhotoSessionPolicy.SessionPhase.PROCESSING, policy.phase)
-        assertEquals("/cache/capture1.jpg", policy.pendingCaptureFilePath)
+        assertEquals(capturePath, policy.pendingCaptureFilePath)
+        assertTrue("Viewport decode must be scheduled during PROCESSING", policy.shouldScheduleViewportDecode())
+        assertEquals(capturePath, policy.getPhotoPathForViewportDecode())
+        val restoration = policy.getRestorationAction()
+        assertTrue(restoration is CameraPhotoSessionPolicy.RestorationAction.ResumeProcessing)
+        val resumeAction = restoration as CameraPhotoSessionPolicy.RestorationAction.ResumeProcessing
+        assertEquals(capturePath, resumeAction.filePath)
+        assertEquals(generation, resumeAction.generation)
     }
 
     @Test
@@ -76,7 +84,7 @@ class CameraPhotoSessionPolicyTest {
     }
 
     @Test
-    fun restorationDuringCameraInFlightWaitsForCamera() {
+    fun restorationDuringCameraInFlightHandlesCaptureResult() {
         val policy = CameraPhotoSessionPolicy(
             initialPendingPath = "/cache/camera_active.jpg",
             initialGeneration = 3L,
@@ -85,6 +93,25 @@ class CameraPhotoSessionPolicyTest {
 
         val restoration = policy.getRestorationAction()
         assertEquals(CameraPhotoSessionPolicy.RestorationAction.WaitForCameraResult, restoration)
+
+        val success = policy.onCaptureResult(success = true, fileExistsAndNotEmpty = true)
+        assertTrue(success is CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode)
+        success as CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode
+        assertEquals(3L, success.generation)
+        assertEquals("/cache/camera_active.jpg", success.filePath)
+        assertEquals(CameraPhotoSessionPolicy.SessionPhase.PROCESSING, policy.phase)
+
+        val cancelledPolicy = CameraPhotoSessionPolicy(
+            initialPendingPath = "/cache/camera_cancelled.jpg",
+            initialGeneration = 4L,
+            initialPhase = CameraPhotoSessionPolicy.SessionPhase.CAMERA_IN_FLIGHT,
+        )
+        val cancelled = cancelledPolicy.onCaptureResult(success = false, fileExistsAndNotEmpty = false)
+        assertTrue(cancelled is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession)
+        cancelled as CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession
+        assertEquals("/cache/camera_cancelled.jpg", cancelled.fileToDelete)
+        assertEquals(CameraPhotoSessionPolicy.SessionPhase.IDLE, cancelledPolicy.phase)
+        assertNull(cancelledPolicy.pendingCaptureFilePath)
     }
 
     @Test
@@ -294,47 +321,6 @@ class CameraPhotoSessionPolicyTest {
         assertFalse(processingPolicy.canLaunchCamera(isRestart = false))
         assertFalse(processingPolicy.canLaunchCamera(isRestart = true))
         assertFalse(processingPolicy.resetPreparingForRestart())
-    }
-
-    @Test
-    fun processRestorationCaptureCallbackTest() {
-        // Activity recreated after process death while camera was in flight
-        val policy = CameraPhotoSessionPolicy(
-            initialPendingPath = "/cache/restored_capture.jpg",
-            initialActivePath = null,
-            initialGeneration = 42L,
-            initialPhase = CameraPhotoSessionPolicy.SessionPhase.CAMERA_IN_FLIGHT,
-        )
-
-        // Restoration action confirms waiting for camera callback
-        val restoration = policy.getRestorationAction()
-        assertEquals(CameraPhotoSessionPolicy.RestorationAction.WaitForCameraResult, restoration)
-
-        // Synchronous camera activity result callback arrives with success
-        val action = policy.onCaptureResult(success = true, fileExistsAndNotEmpty = true)
-
-        // Synchronous state transition immediately to PROCESSING
-        assertEquals(CameraPhotoSessionPolicy.SessionPhase.PROCESSING, policy.phase)
-        assertTrue(action is CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode)
-        val proceed = action as CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode
-        assertEquals(42L, proceed.generation)
-        assertEquals("/cache/restored_capture.jpg", proceed.filePath)
-        assertEquals("/cache/restored_capture.jpg", policy.pendingCaptureFilePath)
-        assertEquals(42L, policy.currentGeneration)
-
-        // Test failure case after process restoration
-        val failPolicy = CameraPhotoSessionPolicy(
-            initialPendingPath = "/cache/restored_fail.jpg",
-            initialActivePath = null,
-            initialGeneration = 42L,
-            initialPhase = CameraPhotoSessionPolicy.SessionPhase.CAMERA_IN_FLIGHT,
-        )
-        val failAction = failPolicy.onCaptureResult(success = false, fileExistsAndNotEmpty = false)
-        assertEquals(CameraPhotoSessionPolicy.SessionPhase.IDLE, failPolicy.phase)
-        assertTrue(failAction is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession)
-        val discard = failAction as CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession
-        assertEquals("/cache/restored_fail.jpg", discard.fileToDelete)
-        assertNull(failPolicy.pendingCaptureFilePath)
     }
 
     @Test
