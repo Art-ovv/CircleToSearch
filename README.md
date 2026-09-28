@@ -58,6 +58,21 @@ search and downloading on-device language models.
 - Hardened Google Lens and multi-engine image search fallbacks for Google,
   Bing, Yandex, and TinEye.
 
+### Camera photo search
+
+- Added main-screen Camera button launching the installed system camera via
+  `ActivityResultContracts.TakePicture` without requiring app `CAMERA` permissions.
+- Captured photos open directly in the local selection overlay with existing image
+  selection, on-device OCR text copying, screen and per-text translation, QR/barcode
+  scanning, share/save, and explicit external image search.
+- Preserves the entire photo without stretching or cropping by decoding off-thread
+  with bounded dimensions, normalizing EXIF orientation via platform `ImageDecoder`,
+  and aspect-fitting onto a viewport-proportioned canvas with neutral letterboxing.
+- Resilient against activity recreation, process death, cancellation, missing camera
+  apps, empty output, repeated taps, and stale work, with stable temporary capture paths,
+  completion sidecar markers, and best-effort cleanup of orphaned temporary files
+  older than 24 hours (with in-flight captures protected for at least 15 minutes).
+
 ### UI, performance, and storage
 
 - Reworked scan feedback, selection trails, control transitions, and result
@@ -115,6 +130,9 @@ Useful local checks:
 ./gradlew assembleDebug
 ./gradlew lintDebug
 ```
+
+> [!NOTE]
+> Camera photo search features are verified via automated unit tests; physical-device testing has not been performed in this environment.
 
 Connected instrumentation tests are intentionally separate because they
 install test packages on the selected device:

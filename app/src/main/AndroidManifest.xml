@@ -146,6 +146,13 @@
             android:taskAffinity="" />
 
         <activity
+            android:name=".CameraSearchActivity"
+            android:exported="false"
+            android:theme="@style/Theme.CircleToSearch"
+            android:excludeFromRecents="true"
+            android:taskAffinity="" />
+
+        <activity
             android:name=".TileTriggerActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
