@@ -96,7 +96,7 @@ fun PrivacyDialog(
                 PrivacySection(
                     icon = Icons.Filled.Info,
                     question = "Does this app upload my searched images anywhere other than search engines?",
-                    answer = "Yes! ✅\nYour images are uploaded to LitterBox and Catbox third-party services to generate image url.\n\n• Litterbox → Auto-delete image after 1 hour\n• Catbox → Used only when Litterbox fails (stores image forever\n\nImportant: Litterbox is actually part of Catbox.\n" +
+                    answer = "Pressing Search in the screen overlay sends the whole screenshot for image search. Pressing the camera shutter sends the whole captured photo. In multi-search mode the image is uploaded to Litterbox, with Catbox as a fallback; in Google Lens mode it is handed to the Google app.\n\nYour images are uploaded to LitterBox and Catbox third-party services to generate image url.\n\n• Litterbox → Auto-delete image after 1 hour\n• Catbox → Used only when Litterbox fails (stores image forever\n\nImportant: Litterbox is actually part of Catbox.\n" +
                             "They belong to the same service family and may use similar infrastructure.)"
                 )
 

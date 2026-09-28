@@ -5,20 +5,27 @@
 
 package com.akslabs.circletosearch
 
-import android.content.ActivityNotFoundException
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.Settings
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.view.CameraController
+import androidx.camera.view.LifecycleCameraController
+import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -27,6 +34,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -38,6 +48,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.akslabs.circletosearch.ui.CircleToSearchScreen
 import com.akslabs.circletosearch.ui.components.CopyTextOverlayManager
@@ -61,7 +73,10 @@ class CameraSearchActivity : ComponentActivity() {
         private const val KEY_ACTIVE_PHOTO_PATH = "KEY_ACTIVE_PHOTO_PATH"
         private const val KEY_SESSION_GENERATION = "KEY_SESSION_GENERATION"
         private const val KEY_SESSION_PHASE = "KEY_SESSION_PHASE"
-        private const val KEY_CURRENT_CAMERA_URI = "KEY_CURRENT_CAMERA_URI"
+        private const val KEY_SEARCH_STARTED_GENERATION = "KEY_SEARCH_STARTED_GENERATION"
+        private const val KEY_PENDING_AUTO_SEARCH_GENERATION = "KEY_PENDING_AUTO_SEARCH_GENERATION"
+        private const val KEY_CAMERA_PERMISSION_REQUESTED = "KEY_CAMERA_PERMISSION_REQUESTED"
+        private const val KEY_CAMERA_SETTINGS_REQUIRED = "KEY_CAMERA_SETTINGS_REQUIRED"
     }
 
     private data class DeferredDecodeRequest(
@@ -77,70 +92,32 @@ class CameraSearchActivity : ComponentActivity() {
     private val translatedTextSnapshot = mutableStateOf<Pair<Bitmap, List<TextNode>>?>(null)
     private val isTranslating = mutableStateOf(false)
     private val isLoadingPhoto = mutableStateOf(false)
+    private val cameraAllowed = mutableStateOf(false)
+    private val cameraSettingsRequired = mutableStateOf(false)
+    private var cameraPermissionRequested = false
+    private val captureInProgress = mutableStateOf(false)
+    private val autoSearchGeneration = mutableStateOf<Long?>(null)
+    private var searchStartedGeneration: Long? = null
+    private var pendingAutoSearchGeneration: Long? = null
+    private var cameraController: LifecycleCameraController? = null
 
     private var loadJob: Job? = null
     private var translationJob: Job? = null
     private var translationTextCoordinator = ScreenTranslationTextCoordinator()
 
-    private var currentCameraUri: Uri? = null
     private var measuredViewportSize: Pair<Int, Int>? = null
+    private var displayedViewportSize: Pair<Int, Int>? = null
     private var deferredDecode: DeferredDecodeRequest? = null
 
-    private val takePictureLauncher = registerForActivityResult(
-        ActivityResultContracts.TakePicture(),
-    ) { success ->
-        val uri = currentCameraUri
-        currentCameraUri = null
-        revokeCameraUri(uri)
-
-        if (success) {
-            when (val action = sessionPolicy.onCaptureResult(success = true, fileExistsAndNotEmpty = true)) {
-                is CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode -> {
-                    CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                        sessionId,
-                        sessionPolicy.getFilesToPreserve(),
-                    )
-                    loadAndDisplayPhoto(action.filePath, action.generation)
-                }
-                is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingRetainActive -> {
-                    CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                        sessionId,
-                        sessionPolicy.getFilesToPreserve(),
-                    )
-                    CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
-                }
-                is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession -> {
-                    CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                        sessionId,
-                        sessionPolicy.getFilesToPreserve(),
-                    )
-                    CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
-                    isLoadingPhoto.value = false
-                    deferredDecode = null
-                    finish()
-                }
-            }
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            cameraSettingsRequired.value = false
+            startCameraPreview()
         } else {
-            when (val action = sessionPolicy.onCaptureResult(success = false, fileExistsAndNotEmpty = false)) {
-                is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingRetainActive -> {
-                    CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                        sessionId,
-                        sessionPolicy.getFilesToPreserve(),
-                    )
-                    CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
-                }
-                is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession -> {
-                    CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                        sessionId,
-                        sessionPolicy.getFilesToPreserve(),
-                    )
-                    CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
-                    isLoadingPhoto.value = false
-                    deferredDecode = null
-                    finish()
-                }
-                is CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode -> {}
-            }
+            cameraAllowed.value = false
+            cameraSettingsRequired.value = !shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)
         }
     }
 
@@ -165,7 +142,14 @@ class CameraSearchActivity : ComponentActivity() {
         } ?: CameraPhotoSessionPolicy.SessionPhase.IDLE
 
         sessionId = savedInstanceState?.getString(KEY_SESSION_ID) ?: UUID.randomUUID().toString()
-        currentCameraUri = savedInstanceState?.getString(KEY_CURRENT_CAMERA_URI)?.let(Uri::parse)
+        searchStartedGeneration = savedInstanceState
+            ?.takeIf { it.containsKey(KEY_SEARCH_STARTED_GENERATION) }
+            ?.getLong(KEY_SEARCH_STARTED_GENERATION)
+        pendingAutoSearchGeneration = savedInstanceState
+            ?.takeIf { it.containsKey(KEY_PENDING_AUTO_SEARCH_GENERATION) }
+            ?.getLong(KEY_PENDING_AUTO_SEARCH_GENERATION)
+        cameraPermissionRequested = savedInstanceState?.getBoolean(KEY_CAMERA_PERMISSION_REQUESTED) ?: false
+        cameraSettingsRequired.value = savedInstanceState?.getBoolean(KEY_CAMERA_SETTINGS_REQUIRED) ?: false
 
         sessionPolicy = CameraPhotoSessionPolicy(
             initialPendingPath = restoredPending,
@@ -203,10 +187,72 @@ class CameraSearchActivity : ComponentActivity() {
                             }
                     ) {
                         val currentBitmap = photoBitmap.value
+                        if (currentBitmap == null && !isLoadingPhoto.value) {
+                            val controller = cameraController
+                            if (cameraAllowed.value && controller != null) {
+                                AndroidView(
+                                    factory = { context ->
+                                        PreviewView(context).apply {
+                                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                                            this.controller = controller
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                                Column(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .navigationBarsPadding()
+                                        .padding(bottom = 24.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    Text(
+                                        "Shutter sends the whole photo to Litterbox/Catbox or Google Lens for search",
+                                        color = Color.White,
+                                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+                                    )
+                                    Button(onClick = ::capturePhoto, enabled = !captureInProgress.value) {
+                                        Text(if (captureInProgress.value) "Taking photo..." else "Take photo & search")
+                                    }
+                                }
+                            } else {
+                                Column(
+                                    modifier = Modifier.align(Alignment.Center),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    Text("Camera access is needed to search a photo", color = Color.White)
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Button(onClick = {
+                                        if (cameraSettingsRequired.value) {
+                                            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                                Uri.parse("package:$packageName")))
+                                        } else {
+                                            requestCameraPermission()
+                                        }
+                                    }) {
+                                        Text(if (cameraSettingsRequired.value) "Open app settings" else "Allow camera")
+                                    }
+                                }
+                            }
+                        }
                         if (currentBitmap != null) {
                             androidx.compose.runtime.key(currentBitmap) {
                                 CircleToSearchScreen(
                                     screenshot = currentBitmap,
+                                    autoSearchRequestId = autoSearchGeneration.value,
+                                    onAutoSearchStarted = { generation ->
+                                        searchStartedGeneration = generation
+                                        pendingAutoSearchGeneration = null
+                                    },
+                                    onAutoSearchDismissed = {
+                                        autoSearchGeneration.value = null
+                                        val viewport = measuredViewportSize
+                                        val activePath = sessionPolicy.activePhotoFilePath
+                                        if (viewport != null && viewport != displayedViewportSize && activePath != null) {
+                                            loadAndDisplayPhoto(activePath, sessionPolicy.currentGeneration,
+                                                viewport.first, viewport.second)
+                                        }
+                                    },
                                     preparedTextNodes = translatedTextSnapshot.value
                                         ?.takeIf { it.first === currentBitmap }?.second,
                                     onClose = { finish() },
@@ -282,9 +328,7 @@ class CameraSearchActivity : ComponentActivity() {
             }
         }
 
-        if (savedInstanceState == null) {
-            launchCamera()
-        } else {
+        if (savedInstanceState != null) {
             when (val action = sessionPolicy.getRestorationAction()) {
                 is CameraPhotoSessionPolicy.RestorationAction.ResumeProcessing -> {
                     loadAndDisplayPhoto(action.filePath, action.generation)
@@ -293,7 +337,7 @@ class CameraSearchActivity : ComponentActivity() {
                     loadAndDisplayPhoto(action.filePath, action.generation)
                 }
                 is CameraPhotoSessionPolicy.RestorationAction.WaitForCameraResult -> {
-                    // Retain state and wait for takePictureLauncher callback
+                    discardInterruptedCapture()
                 }
                 is CameraPhotoSessionPolicy.RestorationAction.RelaunchCamera -> {
                     val stalePending = sessionPolicy.pendingCaptureFilePath
@@ -305,14 +349,18 @@ class CameraSearchActivity : ComponentActivity() {
                     if (stalePending != null) {
                         CameraPhotoFileManager.deleteFileAsync(stalePending)
                     }
-                    launchCamera(isRestart = true)
                 }
                 is CameraPhotoSessionPolicy.RestorationAction.FinishSession -> {
+                    // The in-app camera has no pending file while its preview is idle.
                     isLoadingPhoto.value = false
                     deferredDecode = null
-                    finish()
                 }
             }
+        }
+        if (!cameraPermissionRequested ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        ) {
+            requestCameraPermission()
         }
     }
 
@@ -323,7 +371,20 @@ class CameraSearchActivity : ComponentActivity() {
         outState.putString(KEY_ACTIVE_PHOTO_PATH, sessionPolicy.activePhotoFilePath)
         outState.putLong(KEY_SESSION_GENERATION, sessionPolicy.currentGeneration)
         outState.putString(KEY_SESSION_PHASE, sessionPolicy.phase.name)
-        currentCameraUri?.let { outState.putString(KEY_CURRENT_CAMERA_URI, it.toString()) }
+        searchStartedGeneration?.let { outState.putLong(KEY_SEARCH_STARTED_GENERATION, it) }
+        pendingAutoSearchGeneration?.let { outState.putLong(KEY_PENDING_AUTO_SEARCH_GENERATION, it) }
+        outState.putBoolean(KEY_CAMERA_PERMISSION_REQUESTED, cameraPermissionRequested)
+        outState.putBoolean(KEY_CAMERA_SETTINGS_REQUIRED, cameraSettingsRequired.value)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::sessionPolicy.isInitialized &&
+            sessionPolicy.phase == CameraPhotoSessionPolicy.SessionPhase.IDLE &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        ) {
+            startCameraPreview()
+        }
     }
 
     private fun onViewportMeasured(width: Int, height: Int) {
@@ -347,7 +408,7 @@ class CameraSearchActivity : ComponentActivity() {
         if (pending != null) {
             deferredDecode = null
             loadAndDisplayPhoto(pending.filePath, pending.generation, width, height)
-        } else if (sizeChanged) {
+        } else if (sizeChanged && autoSearchGeneration.value == null) {
             val pathToLoad = sessionPolicy.getPhotoPathForViewportDecode()
             if (pathToLoad != null) {
                 loadAndDisplayPhoto(pathToLoad, sessionPolicy.currentGeneration, width, height)
@@ -355,96 +416,119 @@ class CameraSearchActivity : ComponentActivity() {
         }
     }
 
-    private fun launchCamera(isRestart: Boolean = false) {
-        if (!sessionPolicy.canLaunchCamera(isRestart)) {
-            return
+    private fun requestCameraPermission() {
+        if (isFinishing || isDestroyed) return
+        if (sessionPolicy.phase == CameraPhotoSessionPolicy.SessionPhase.VIEWING ||
+            sessionPolicy.phase == CameraPhotoSessionPolicy.SessionPhase.PROCESSING
+        ) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startCameraPreview()
+        } else {
+            cameraPermissionRequested = true
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
-        sessionPolicy.markPreparing()
-        CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-            sessionId,
-            sessionPolicy.getFilesToPreserve(),
-        )
+    }
 
+    private fun startCameraPreview() {
+        if (isFinishing || isDestroyed || cameraController != null) return
+        try {
+            cameraController = LifecycleCameraController(this).apply {
+                cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                setEnabledUseCases(CameraController.IMAGE_CAPTURE)
+                bindToLifecycle(this@CameraSearchActivity)
+            }
+            cameraAllowed.value = true
+        } catch (error: Exception) {
+            cameraAllowed.value = false
+            Toast.makeText(this, "Could not start camera", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun capturePhoto() {
+        val controller = cameraController ?: return
+        if (captureInProgress.value || !sessionPolicy.canLaunchCamera()) return
+        captureInProgress.value = true
+        sessionPolicy.markPreparing()
         lifecycleScope.launch {
             var createdFile: File? = null
-            var uri: Uri? = null
-            var isDelivered = false
             try {
                 val prepared = CameraPhotoFileManager.preparePendingCapture(
                     context = this@CameraSearchActivity,
-                    onFileCreated = { file ->
-                        createdFile = file
-                    },
+                    onFileCreated = { createdFile = it },
                 )
                 createdFile = prepared.file
-                uri = prepared.uri
-                currentCameraUri = uri
-
-                sessionPolicy.prepareCapture(prepared.file.absolutePath)
+                val generation = sessionPolicy.prepareCapture(prepared.file.absolutePath)
                 sessionPolicy.markCameraLaunched()
                 CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                    sessionId,
-                    sessionPolicy.getFilesToPreserve(),
+                    sessionId, sessionPolicy.getFilesToPreserve(),
                 )
+                val output = ImageCapture.OutputFileOptions.Builder(prepared.file).build()
+                controller.takePicture(output, ContextCompat.getMainExecutor(this@CameraSearchActivity),
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                            onCaptureFinished(generation, prepared.file, success = true)
+                        }
 
-                takePictureLauncher.launch(uri)
-                isDelivered = true
-            } catch (e: CancellationException) {
-                currentCameraUri = null
-                revokeCameraUri(uri)
-                throw e
-            } catch (e: ActivityNotFoundException) {
-                currentCameraUri = null
-                revokeCameraUri(uri)
-                Toast.makeText(this@CameraSearchActivity, "No camera app found", Toast.LENGTH_SHORT).show()
+                        override fun onError(error: androidx.camera.core.ImageCaptureException) {
+                            onCaptureFinished(generation, prepared.file, success = false)
+                        }
+                    },
+                )
+            } catch (error: CancellationException) {
+                createdFile?.let { CameraPhotoFileManager.deleteFileAsync(it.absolutePath) }
+                throw error
+            } catch (error: Exception) {
                 val action = sessionPolicy.onLaunchFailed(createdFile?.absolutePath)
                 CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                    sessionId,
-                    sessionPolicy.getFilesToPreserve(),
+                    sessionId, sessionPolicy.getFilesToPreserve(),
                 )
                 CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
-                if (action.shouldFinish) {
-                    isLoadingPhoto.value = false
-                    deferredDecode = null
-                    finish()
+                captureInProgress.value = false
+                Toast.makeText(this@CameraSearchActivity, "Could not take photo", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun onCaptureFinished(generation: Long, file: File, success: Boolean) {
+        if (isDestroyed || isFinishing) {
+            CameraPhotoFileManager.deleteFileAsync(file.absolutePath)
+            return
+        }
+        lifecycleScope.launch {
+            val nonEmpty = if (success) withContext(Dispatchers.IO) { file.isFile && file.length() > 0L } else false
+            if (isDestroyed || isFinishing || sessionPolicy.currentGeneration != generation ||
+                sessionPolicy.pendingCaptureFilePath != file.absolutePath
+            ) return@launch
+            captureInProgress.value = false
+            val action = sessionPolicy.onCaptureResult(success, nonEmpty)
+            CameraPhotoFileManager.updateLiveSessionPreservedPaths(
+                sessionId, sessionPolicy.getFilesToPreserve(),
+            )
+            when (action) {
+                is CameraPhotoSessionPolicy.CaptureResultAction.ProceedToDecode -> {
+                    pendingAutoSearchGeneration = generation
+                    cameraController?.unbind()
+                    cameraController = null
+                    loadAndDisplayPhoto(action.filePath, action.generation)
                 }
-            } catch (e: Exception) {
-                currentCameraUri = null
-                revokeCameraUri(uri)
-                android.util.Log.e("CameraSearchActivity", "Failed to launch camera", e)
-                Toast.makeText(this@CameraSearchActivity, "Could not start camera", Toast.LENGTH_SHORT).show()
-                val action = sessionPolicy.onLaunchFailed(createdFile?.absolutePath)
-                CameraPhotoFileManager.updateLiveSessionPreservedPaths(
-                    sessionId,
-                    sessionPolicy.getFilesToPreserve(),
-                )
-                CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
-                if (action.shouldFinish) {
-                    isLoadingPhoto.value = false
-                    deferredDecode = null
-                    finish()
+                is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingFinishSession -> {
+                    CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
+                    Toast.makeText(this@CameraSearchActivity, "Could not take photo. Try again", Toast.LENGTH_SHORT).show()
                 }
-            } finally {
-                if (!isDelivered) {
-                    val fileToClean = createdFile
-                    if (fileToClean != null) {
-                        CameraPhotoFileManager.deleteFileAsync(fileToClean.absolutePath)
-                    }
+                is CameraPhotoSessionPolicy.CaptureResultAction.DiscardPendingRetainActive -> {
+                    CameraPhotoFileManager.deleteFileAsync(action.fileToDelete)
                 }
             }
         }
     }
 
-    private fun revokeCameraUri(uri: Uri?) {
-        if (uri == null) return
-        try {
-            revokeUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
-        } catch (e: Exception) {
-            android.util.Log.w("CameraSearchActivity", "Error revoking camera URI grant", e)
-        }
+    private fun discardInterruptedCapture() {
+        val pending = sessionPolicy.pendingCaptureFilePath
+        sessionPolicy.onCaptureResult(success = false)
+        CameraPhotoFileManager.updateLiveSessionPreservedPaths(
+            sessionId, sessionPolicy.getFilesToPreserve(),
+        )
+        CameraPhotoFileManager.deleteFileAsync(pending)
     }
 
     private fun loadAndDisplayPhoto(
@@ -504,6 +588,10 @@ class CameraSearchActivity : ComponentActivity() {
                         action.previousFileToPrune?.let { CameraPhotoFileManager.deleteFileAsync(it) }
                         translatedTextSnapshot.value = null
                         photoBitmap.value = decodedBitmap
+                        displayedViewportSize = vpWidth to vpHeight
+                        if (pendingAutoSearchGeneration == generation && searchStartedGeneration != generation) {
+                            autoSearchGeneration.value = generation
+                        }
                         replaceCopyTextManager(decodedBitmap)
                         decodedBitmap = null
                     }
@@ -526,6 +614,7 @@ class CameraSearchActivity : ComponentActivity() {
 
                 when (val action = sessionPolicy.onDecodeFailure(generation, filePath)) {
                     is CameraPhotoSessionPolicy.DecodeResultAction.FailureFinishSession -> {
+                        if (pendingAutoSearchGeneration == generation) pendingAutoSearchGeneration = null
                         CameraPhotoFileManager.updateLiveSessionPreservedPaths(
                             sessionId,
                             sessionPolicy.getFilesToPreserve(),
@@ -536,6 +625,7 @@ class CameraSearchActivity : ComponentActivity() {
                         finish()
                     }
                     is CameraPhotoSessionPolicy.DecodeResultAction.FailureRetainActive -> {
+                        if (pendingAutoSearchGeneration == generation) pendingAutoSearchGeneration = null
                         CameraPhotoFileManager.updateLiveSessionPreservedPaths(
                             sessionId,
                             sessionPolicy.getFilesToPreserve(),
@@ -641,6 +731,8 @@ class CameraSearchActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        cameraController?.unbind()
+        cameraController = null
         loadJob?.cancel()
         loadJob = null
         translationJob?.cancel()

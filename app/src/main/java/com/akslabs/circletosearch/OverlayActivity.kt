@@ -86,6 +86,7 @@ class OverlayActivity : ComponentActivity() {
     private var windowMadeNonOccluding = false
     private var screenshotCaptureId = BitmapRepository.NO_CAPTURE_ID
     private var contentGeneration = 0L
+    private var cameraLaunchInProgress = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0))
@@ -118,6 +119,14 @@ class OverlayActivity : ComponentActivity() {
         // Initialize manager for Activity-based layout
         replaceCopyTextManager(screenshotBitmap.value)
 
+        fun closeScreenOverlay() {
+            screenshotBitmap.value?.let { bitmap ->
+                BitmapRepository.clearIfSame(screenshotCaptureId, bitmap)
+            }
+            assistToken.value?.let(com.akslabs.circletosearch.data.AssistDataRepository::clear)
+            finish()
+        }
+
         setContent {
             CircleToSearchTheme {
                 Surface(
@@ -132,14 +141,19 @@ class OverlayActivity : ComponentActivity() {
                                 ?.takeIf { it.first === screenshotBitmap.value }?.second,
                             searchModeOverride = searchModeOverride.value,
                             assistToken = assistToken.value,
-                            onClose = { 
-                                screenshotBitmap.value?.let { bitmap ->
-                                    BitmapRepository.clearIfSame(screenshotCaptureId, bitmap)
+                            onClose = ::closeScreenOverlay,
+                            onOpenCamera = {
+                                if (!cameraLaunchInProgress && !isFinishing && !isDestroyed) {
+                                    cameraLaunchInProgress = true
+                                    try {
+                                        startActivity(android.content.Intent(this@OverlayActivity, CameraSearchActivity::class.java))
+                                        closeScreenOverlay()
+                                    } catch (error: Exception) {
+                                        cameraLaunchInProgress = false
+                                        android.util.Log.e("OverlayActivity", "Could not open camera search", error)
+                                        Toast.makeText(this@OverlayActivity, "Could not open camera", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
-                                assistToken.value?.let(
-                                    com.akslabs.circletosearch.data.AssistDataRepository::clear,
-                                )
-                                finish() 
                             },
                             copyTextManager = copyTextManager.value,
                             onExitCopyMode = {

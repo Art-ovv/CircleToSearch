@@ -250,7 +250,7 @@ class CameraPhotoSessionPolicyTest {
     }
 
     @Test
-    fun finishSessionPreservesPendingFileIfCameraInFlight() {
+    fun finishSessionDeletesPendingFileIfCameraInFlight() {
         val policy = CameraPhotoSessionPolicy(
             initialPendingPath = "/cache/pending.jpg",
             initialActivePath = "/cache/active.jpg",
@@ -258,9 +258,8 @@ class CameraPhotoSessionPolicyTest {
             initialPhase = CameraPhotoSessionPolicy.SessionPhase.CAMERA_IN_FLIGHT,
         )
 
-        // Pending file must not be returned for immediate deletion if camera may still be writing
         val toDelete = policy.onFinish()
-        assertEquals(setOf("/cache/active.jpg"), toDelete)
+        assertEquals(setOf("/cache/active.jpg", "/cache/pending.jpg"), toDelete)
         assertNull(policy.pendingCaptureFilePath)
         assertNull(policy.activePhotoFilePath)
         assertEquals(CameraPhotoSessionPolicy.SessionPhase.IDLE, policy.phase)

@@ -22,6 +22,8 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Required by the user-facing per-app overlay exclusion picker. -->
@@ -45,7 +47,8 @@
              strictly on-device, so initialization is owned by PaddleOcrEngine instead. -->
         <provider
             android:name="ai.onnxruntime.TelemetryInitializer"
-            tools:node="remove" />
+            tools:node="remove"
+            tools:ignore="MissingClass" />
 
         <activity
             android:name=".MainActivity"

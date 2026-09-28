@@ -286,10 +286,49 @@ private fun copyDetectedCode(
     ).show()
 }
 
+@Composable
+private fun CompactScanAction(
+    modifier: Modifier,
+    label: String,
+    description: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+    icon: @Composable () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            .height(64.dp)
+            .semantics { contentDescription = description },
+        shape = RoundedCornerShape(18.dp),
+        color = Color.Transparent,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            icon()
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun CircleToSearchScreen(
     screenshot: Bitmap?,
+    autoSearchRequestId: Long? = null,
+    onAutoSearchStarted: (Long) -> Unit = {},
+    onAutoSearchDismissed: () -> Unit = {},
     preparedTextNodes: List<com.akslabs.circletosearch.ui.components.TextNode>? = null,
     onClose: () -> Unit,
     searchModeOverride: Boolean? = null,
@@ -298,6 +337,7 @@ fun CircleToSearchScreen(
     onCopyText: () -> Unit = {},
     onExitCopyMode: () -> Unit = {},
     onTranslate: () -> Unit = {},
+    onOpenCamera: (() -> Unit)? = null,
     onTextAnalysisUpdate: (
         Bitmap?,
         List<com.akslabs.circletosearch.ui.components.TextNode>,
@@ -571,6 +611,12 @@ fun CircleToSearchScreen(
     val selectionBitmapOwnerActive = remember(screenshot) { AtomicBoolean(true) }
     val selectionCropGeneration = remember(screenshot) { AtomicLong(0L) }
     var isSearching by remember { mutableStateOf(false) }
+    var screenSearchGeneration by remember(screenshot) { mutableStateOf(0L) }
+    var screenSearchRequestId by remember(screenshot) { mutableStateOf<Long?>(null) }
+    val activeFullScreenSearchId = autoSearchRequestId ?: screenSearchRequestId
+    fun dismissFullScreenSearch() {
+        if (autoSearchRequestId != null) onAutoSearchDismissed() else screenSearchRequestId = null
+    }
     var selectionRect by remember { mutableStateOf<Rect?>(null) }
     var committedSelectionRect by remember(screenshot) { mutableStateOf<Rect?>(null) }
     var isSelectionReady by remember(screenshot) { mutableStateOf(false) }
@@ -699,6 +745,26 @@ fun CircleToSearchScreen(
         ) {
             bitmap.recycle()
         }
+    }
+
+    fun searchWholeScreen() {
+        if (screenshot == null || activeFullScreenSearchId != null) return
+        selectionCropGeneration.incrementAndGet()
+        selectionRuntime.cropJob?.cancel()
+        selectionTextGeneration.incrementAndGet()
+        selectionRuntime.textJob?.cancel()
+        pendingSelectionTextRect = null
+        isRefiningSelectionText = false
+        val displacedBitmap = selectedBitmap
+        selectedBitmap = null
+        displacedBitmap?.let(::recycleSelectionBitmapIfIdle)
+        selectionRect = null
+        committedSelectionRect = null
+        isSelectionReady = false
+        updateSelectionBracketPaths(selectionBracketPaths, null)
+        updateSelectionHolePath(selectionHolePath, null)
+        screenSearchGeneration += 1
+        screenSearchRequestId = screenSearchGeneration
     }
 
     fun updateSelectionCrop(rect: Rect) {
@@ -1063,7 +1129,7 @@ fun CircleToSearchScreen(
             updateSelectionBracketPaths(selectionBracketPaths, null)
             updateSelectionHolePath(selectionHolePath, null)
             selectedBitmap = null
-            isSearching = false
+            if (activeFullScreenSearchId == null) isSearching = false
             currentPathPoints.clear()
             selectionTrailPath.reset()
             selectionAnim.snapTo(0f)
@@ -1295,13 +1361,14 @@ fun CircleToSearchScreen(
     }
 
     // Back Handler Logic
-    LaunchedEffect(scaffoldState.bottomSheetState) {
+    LaunchedEffect(scaffoldState.bottomSheetState, activeFullScreenSearchId) {
         var sheetWasVisible =
             scaffoldState.bottomSheetState.currentValue != androidx.compose.material3.SheetValue.Hidden
         snapshotFlow { scaffoldState.bottomSheetState.currentValue }.collect { sheetValue ->
             if (sheetValue == androidx.compose.material3.SheetValue.Hidden && sheetWasVisible) {
                 isSearching = false
                 isLoading = false
+                if (activeFullScreenSearchId != null) dismissFullScreenSearch()
             }
             sheetWasVisible = sheetValue != androidx.compose.material3.SheetValue.Hidden
         }
@@ -1392,8 +1459,8 @@ fun CircleToSearchScreen(
                 }
 
                 // Reset everything when bitmap changes (new area selected)
-                LaunchedEffect(selectedBitmap) {
-                    isSearching = false
+                LaunchedEffect(selectedBitmap, activeFullScreenSearchId) {
+                    if (activeFullScreenSearchId == null) isSearching = false
                     hostedImageUrl = null
                     searchUrl = null
                     preloadedUrls.clear()
@@ -1411,15 +1478,22 @@ fun CircleToSearchScreen(
                     webViews.clear()
                 }
 
-                LaunchedEffect(selectedBitmap, isSearching) {
-                    val searchBitmap = selectedBitmap
-                    if (!isSearching || searchBitmap == null) {
+                val manualSearchBitmap = if (activeFullScreenSearchId == null && isSearching) selectedBitmap else null
+                LaunchedEffect(activeFullScreenSearchId, if (activeFullScreenSearchId != null) screenshot else null, manualSearchBitmap) {
+                    val isAutoSearch = activeFullScreenSearchId != null
+                    val searchBitmap = if (isAutoSearch) screenshot else manualSearchBitmap
+                    if (searchBitmap == null) {
                         isLoading = false
                     } else if (!retainSelectionBitmap(searchBitmap)) {
                         isLoading = false
                         isSearching = false
+                        if (isAutoSearch) dismissFullScreenSearch()
                     } else {
                         try {
+                            if (isAutoSearch) {
+                                if (autoSearchRequestId != null) onAutoSearchStarted(autoSearchRequestId)
+                                isSearching = true
+                            }
                             isLoading = true
                         
                         val effectiveLensOnly = searchModeOverride ?: isGoogleLensOnly
@@ -1439,6 +1513,7 @@ fun CircleToSearchScreen(
                                 android.util.Log.e("CircleToSearch", "Could not prepare Lens image", error)
                                 isLoading = false
                                 isSearching = false
+                                if (isAutoSearch) dismissFullScreenSearch()
                                 android.widget.Toast.makeText(
                                     context,
                                     "Could not prepare image search",
@@ -1455,6 +1530,7 @@ fun CircleToSearchScreen(
                                     // cannot be deleted before the receiving app opens the image.
                                     isLoading = false
                                     isSearching = false
+                                    if (isAutoSearch) dismissFullScreenSearch()
                                     return@LaunchedEffect
                                 }
                                 com.akslabs.circletosearch.ui.components.LensLaunchResult.FAILED -> {
@@ -1474,6 +1550,7 @@ fun CircleToSearchScreen(
                         if (imageUrl == null) {
                             isLoading = false
                             isSearching = false
+                            if (isAutoSearch) dismissFullScreenSearch()
                             android.widget.Toast.makeText(
                                 context,
                                 "Could not start image search",
@@ -1700,7 +1777,7 @@ fun CircleToSearchScreen(
             }
 
             // 2. Gradient Border Layer (Overlaying screenshot, clipped to rounded corners)
-            if (showGradientBorder) {
+            if (showGradientBorder && (onOpenCamera == null || isSearching)) {
                 androidx.compose.animation.AnimatedVisibility(
                     visible = isUIVisible,
                     enter = androidx.compose.animation.fadeIn(animationSpec = tween(700))
@@ -1777,7 +1854,7 @@ fun CircleToSearchScreen(
 
             // 4. Header (Top)
             androidx.compose.animation.AnimatedVisibility(
-                visible = isUIVisible,
+                visible = isUIVisible && (onOpenCamera == null || isSearching),
                 enter = androidx.compose.animation.slideInVertically(
                     initialOffsetY = { -it }, // Commence au-dessus de l'écran (-100%)
                     animationSpec = tween(500, easing = androidx.compose.animation.core.FastOutSlowInEasing)
@@ -1983,7 +2060,7 @@ fun CircleToSearchScreen(
                     }
                 }
             }
-            // 5. Bottom Bar — Material 3 Expressive two-row card
+            // 5. Main actions
 
             androidx.compose.animation.AnimatedVisibility(
                 visible = isUIVisible,
@@ -1997,6 +2074,54 @@ fun CircleToSearchScreen(
                 ) + fadeOut(animationSpec = tween(200)),
                 modifier = Modifier.align(Alignment.BottomCenter).zIndex(2000f)
             ) {
+                if (onOpenCamera != null) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .navigationBarsPadding()
+                            .fillMaxWidth(0.86f)
+                            .padding(bottom = 16.dp),
+                        shape = RoundedCornerShape(22.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
+                        shadowElevation = 4.dp,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(5.dp),
+                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                        ) {
+                            CompactScanAction(
+                                modifier = Modifier.weight(1f),
+                                label = "Search",
+                                description = "Search the whole screen image with Litterbox or Catbox, or Google Lens",
+                                enabled = screenshot != null,
+                                onClick = ::searchWholeScreen,
+                            ) {
+                                Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(20.dp))
+                            }
+                            CompactScanAction(
+                                modifier = Modifier.weight(1f),
+                                label = "Translate",
+                                description = "Translate screen text",
+                                enabled = screenshot != null,
+                                onClick = onTranslate,
+                            ) {
+                                Icon(Icons.Default.Translate, contentDescription = null, modifier = Modifier.size(20.dp))
+                            }
+                            CompactScanAction(
+                                modifier = Modifier.weight(1f),
+                                label = "Camera",
+                                description = "Search with camera",
+                                onClick = onOpenCamera,
+                            ) {
+                                Icon(
+                                    painterResource(com.akslabs.circletosearch.R.drawable.ic_camera),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                        }
+                    }
+                } else {
                 // ── Outer card container ──────────────────────────────────────────
                 androidx.compose.material3.Surface(
                     modifier = Modifier
@@ -2179,6 +2304,7 @@ fun CircleToSearchScreen(
                             }
                         }
                     }
+                }
                 }
             }
 
@@ -2528,7 +2654,7 @@ fun CircleToSearchScreen(
         }
 
         // --- NEW: Smart Entities (QR, Links, etc.) Overlay Chips ---
-        if (screenshot != null && detectedEntities.isNotEmpty() && !showQrSheet) {
+        if (screenshot != null && detectedEntities.isNotEmpty() && !showQrSheet && isUIVisible) {
             BoxWithConstraints(modifier = Modifier.fillMaxSize().zIndex(2600f)) {
                 val screenWidth = maxWidth
                 val screenHeight = maxHeight

@@ -207,10 +207,7 @@ class CameraPhotoSessionPolicy(
     fun onFinish(): Set<String> {
         val filesToDelete = mutableSetOf<String>()
         activePhotoFilePath?.let(filesToDelete::add)
-        // If the external camera may still be writing, preserve the pending file
-        if (phase != SessionPhase.CAMERA_IN_FLIGHT) {
-            pendingCaptureFilePath?.let(filesToDelete::add)
-        }
+        pendingCaptureFilePath?.let(filesToDelete::add)
         pendingCaptureFilePath = null
         activePhotoFilePath = null
         phase = SessionPhase.IDLE
