@@ -607,6 +607,7 @@ fun CircleToSearchScreen(
         )
     }
     var selectedBitmap by remember(screenshot) { mutableStateOf<Bitmap?>(null) }
+    var pendingLensFallbackUri by remember(screenshot, selectedBitmap) { mutableStateOf<Uri?>(null) }
     val selectionBitmapConsumers = remember(screenshot) { IdentityHashMap<Bitmap, Int>() }
     val selectionBitmapOwnerActive = remember(screenshot) { AtomicBoolean(true) }
     val selectionCropGeneration = remember(screenshot) { AtomicLong(0L) }
@@ -1490,6 +1491,7 @@ fun CircleToSearchScreen(
                         if (isAutoSearch) dismissFullScreenSearch()
                     } else {
                         try {
+                            pendingLensFallbackUri = null
                             if (isAutoSearch) {
                                 if (autoSearchRequestId != null) onAutoSearchStarted(autoSearchRequestId)
                                 isSearching = true
@@ -1548,14 +1550,28 @@ fun CircleToSearchScreen(
                             .uploadToImageHost(searchBitmap)
                             ?.also { hostedImageUrl = it }
                         if (imageUrl == null) {
+                            val fallbackPath = try {
+                                withContext(Dispatchers.IO) {
+                                    ImageUtils.saveShareBitmap(context, searchBitmap, prefix = "lens")
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                android.util.Log.e("CircleToSearch", "Could not prepare Lens fallback", error)
+                                isLoading = false
+                                isSearching = false
+                                if (isAutoSearch) dismissFullScreenSearch()
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Image hosts unavailable; could not prepare Google Lens",
+                                    android.widget.Toast.LENGTH_SHORT,
+                                ).show()
+                                return@LaunchedEffect
+                            }
+                            pendingLensFallbackUri = Uri.fromFile(java.io.File(fallbackPath))
                             isLoading = false
                             isSearching = false
                             if (isAutoSearch) dismissFullScreenSearch()
-                            android.widget.Toast.makeText(
-                                context,
-                                "Could not start image search",
-                                android.widget.Toast.LENGTH_SHORT,
-                            ).show()
                             return@LaunchedEffect
                         }
 
@@ -2970,6 +2986,35 @@ fun CircleToSearchScreen(
             SettingsScreen(
                 uiPreferences = uiPreferences,
                 onDismissRequest = { showSettingsScreen = false }
+            )
+        }
+
+        pendingLensFallbackUri?.let { fallbackUri ->
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { pendingLensFallbackUri = null },
+                title = { Text("Image search unavailable") },
+                text = { Text("Litterbox and Catbox could not upload the image. Search with Google Lens instead? The image will be sent to Google.") },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        pendingLensFallbackUri = null
+                        if (searchWithGoogleLens(fallbackUri, context) ==
+                            com.akslabs.circletosearch.ui.components.LensLaunchResult.FAILED
+                        ) {
+                            android.widget.Toast.makeText(
+                                context,
+                                "Could not open Google Lens",
+                                android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }) {
+                        Text("Search with Google Lens")
+                    }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { pendingLensFallbackUri = null }) {
+                        Text("Cancel")
+                    }
+                },
             )
         }
 
