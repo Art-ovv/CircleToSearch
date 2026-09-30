@@ -22,9 +22,10 @@ import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
+import java.nio.FloatBuffer
 
 data class DetPreprocessResult(
-    val tensorData: FloatArray,
+    val tensorData: FloatBuffer,
     val shape: LongArray,
     val originalH: Int,
     val originalW: Int,
@@ -108,22 +109,9 @@ object DetPreprocessor {
                 floatMat,
             )
 
-            val channelSize = h * w
-            val tensorData = FloatArray(3 * channelSize)
-            val rowBuffer = FloatArray(w * 3)
-            for (row in 0 until h) {
-                if (row % 16 == 0) cancellationCheck()
+            val tensorData = packNchwTensor(h, w, intArrayOf(w), cancellationCheck) { _, row, rowBuffer ->
                 floatMat.get(row, 0, rowBuffer)
-                val rowOffset = row * w
-                for (column in 0 until w) {
-                    val pixelOffset = column * 3
-                    val tensorOffset = rowOffset + column
-                    tensorData[tensorOffset] = rowBuffer[pixelOffset]
-                    tensorData[channelSize + tensorOffset] = rowBuffer[pixelOffset + 1]
-                    tensorData[2 * channelSize + tensorOffset] = rowBuffer[pixelOffset + 2]
-                }
             }
-            cancellationCheck()
 
             return DetPreprocessResult(
                 tensorData = tensorData,

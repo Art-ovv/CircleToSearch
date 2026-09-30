@@ -18,10 +18,11 @@ import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import java.nio.FloatBuffer
 import kotlin.math.ceil
 
 data class RecPreprocessResult(
-    val tensorData: FloatArray,
+    val tensorData: FloatBuffer,
     val shape: LongArray,
     val validRatios: FloatArray,
 )
@@ -73,31 +74,13 @@ object RecPreprocessor {
 
             val maxWidth = floatMats.maxOf { it.cols() }
             val batchSize = floatMats.size
-            val channelSize = FIXED_HEIGHT * maxWidth
-            val tensorData = FloatArray(batchSize * 3 * channelSize)
-            val validRatios = FloatArray(batchSize)
-            val rowBuffer = FloatArray(maxWidth * 3)
-            for (batchIndex in 0 until batchSize) {
-                val mat = floatMats[batchIndex]
-                val validWidth = mat.cols()
-                validRatios[batchIndex] = validWidth.toFloat() / maxWidth
-                for (row in 0 until FIXED_HEIGHT) {
-                    if (row % 16 == 0) cancellationCheck()
-                    mat.get(row, 0, rowBuffer)
-                    val rowOffset = row * maxWidth
-                    for (column in 0 until validWidth) {
-                        val pixelOffset = column * 3
-                        val tensorOffset = rowOffset + column
-                        tensorData[(batchIndex * 3) * channelSize + tensorOffset] =
-                            rowBuffer[pixelOffset]
-                        tensorData[(batchIndex * 3 + 1) * channelSize + tensorOffset] =
-                            rowBuffer[pixelOffset + 1]
-                        tensorData[(batchIndex * 3 + 2) * channelSize + tensorOffset] =
-                            rowBuffer[pixelOffset + 2]
-                    }
-                }
+            val validWidths = IntArray(batchSize) { floatMats[it].cols() }
+            val validRatios = FloatArray(batchSize) { validWidths[it].toFloat() / maxWidth }
+            val tensorData = packNchwTensor(
+                FIXED_HEIGHT, maxWidth, validWidths, cancellationCheck,
+            ) { batch, row, rowBuffer ->
+                floatMats[batch].get(row, 0, rowBuffer)
             }
-            cancellationCheck()
 
             return RecPreprocessResult(
                 tensorData = tensorData,

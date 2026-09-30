@@ -24,6 +24,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import java.io.File
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.locks.ReentrantLock
 
@@ -93,7 +94,7 @@ class ORTSessionManager(
         }
     }
 
-    suspend fun runDetection(input: FloatArray, shape: LongArray): Pair<FloatArray, LongArray> {
+    suspend fun runDetection(input: FloatBuffer, shape: LongArray): Pair<FloatArray, LongArray> {
         val session = detSession
             ?: throw OCRError.ModelLoadFailed("detection", Exception("Session not initialized"))
         val ortEnv = env
@@ -101,7 +102,7 @@ class ORTSessionManager(
         return runSession(ortEnv, session, detInputName, input, shape, "detection")
     }
 
-    suspend fun runRecognition(input: FloatArray, shape: LongArray): Pair<FloatArray, LongArray> {
+    suspend fun runRecognition(input: FloatBuffer, shape: LongArray): Pair<FloatArray, LongArray> {
         val session = recSession
             ?: throw OCRError.ModelLoadFailed("recognition", Exception("Session not initialized"))
         val ortEnv = env
@@ -159,13 +160,18 @@ class ORTSessionManager(
         ortEnv: OrtEnvironment,
         session: OrtSession,
         inputName: String,
-        input: FloatArray,
+        input: FloatBuffer,
         shape: LongArray,
         modelName: String,
     ): Pair<FloatArray, LongArray> {
         currentCoroutineContext().ensureActive()
         val tensor = try {
-            OnnxTensor.createTensor(ortEnv, FloatBuffer.wrap(input), shape)
+            require(input.isDirect && input.order() == ByteOrder.nativeOrder()) {
+                "OCR input must use a direct buffer in native byte order"
+            }
+            // OnnxTensor retains the buffer through the native run. Closing the tensor releases
+            // its native handle; the per-run backing buffer is reclaimed by GC, never reused here.
+            OnnxTensor.createTensor(ortEnv, input, shape)
         } catch (error: Exception) {
             throw OCRError.InferenceFailed(modelName, error)
         }
