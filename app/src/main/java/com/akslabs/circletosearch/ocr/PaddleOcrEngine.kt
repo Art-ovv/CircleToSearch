@@ -13,24 +13,21 @@ import com.akslabs.circletosearch.ui.components.SmartEntity
 import com.akslabs.circletosearch.ui.components.TextNode
 import com.akslabs.circletosearch.ui.components.Word
 import com.akslabs.circletosearch.utils.QrScanner
-import com.paddle.ocr.EngineConfig
-import com.paddle.ocr.PaddleOCR
-import com.paddle.ocr.PaddleOCRConfig
 import com.paddle.ocr.model.OCRResult
 import com.paddle.ocr.model.OCRRunResult
 import com.paddle.ocr.model.OCRTextSpan
 import com.paddle.ocr.model.OCRError
-import com.paddle.ocr.util.OpenCVUtils
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.lastOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.lang.ref.WeakReference
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.roundToInt
@@ -42,7 +39,7 @@ data class ExtractionResult(
 )
 
 /**
- * Process-wide, fully on-device PaddleOCR pipeline.
+ * Main-process OCR facade. Native inference runs only in the private :ocr process.
  *
  * Native inference is serialized because the cached ONNX sessions are shared. Cancellation is
  * forwarded to the individual ONNX run, while overlay/translation callers retain ownership of
@@ -50,31 +47,52 @@ data class ExtractionResult(
  */
 object PaddleOcrEngine {
     private const val TAG = "PaddleOcrEngine"
-    private const val DET_MODEL_ASSET = "paddleocr/det/inference.onnx"
-    private const val REC_MODEL_ASSET = "paddleocr/rec/inference.onnx"
-    private const val REC_CONFIG_ASSET = "paddleocr/rec/inference.yml"
+    const val DEFAULT_IDLE_TIMEOUT_MS = 15_000L
+
+    interface OcrSessionLease : AutoCloseable {
+        override fun close()
+    }
 
     private val engineMutex = Mutex()
-    private var cachedEngine: PaddleOCR? = null
+    // The worker connection outlives individual UI owners, but only for the bounded idle window.
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val textCache = OcrTextCache<Bitmap, List<TextNode>>()
+    private var processClient: OcrProcessClient? = null
     private var cachedPackId: String? = null
-    private var cachedBitmap = WeakReference<Bitmap>(null)
-    private var cachedTextNodes: List<TextNode>? = null
 
-    private val paddleConfig = PaddleOCRConfig(
-        detMaxSideLimit = 2560,
-        detMaxPixelCount = 2_500_000,
-        detBoxThresh = 0.5f,
-        detMaxCandidates = 512,
-        recScoreThresh = 0.35f,
-        recBatchSize = 4,
+    private val lifecycleCoordinator = OcrLifecycleCoordinator(
+        scope = engineScope,
+        idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+        releaseMutex = engineMutex,
+        releaseImmediatelyOnUiHidden = false,
+        releaseAction = { detachAndReleaseEngine() },
+        onReleaseFailure = { Log.e(TAG, "Unable to release idle OCR engine", it) },
     )
 
-    suspend fun warmUp(context: Context) {
+    fun acquireSession(): OcrSessionLease = lifecycleCoordinator.acquireSession()
+
+    fun requestReleaseIfIdle() {
+        lifecycleCoordinator.requestReleaseIfIdle()
+    }
+
+    fun onTrimMemory(level: Int) {
+        lifecycleCoordinator.onTrimMemory(level)
+    }
+
+    fun clearTextCache(bitmap: Bitmap) {
+        textCache.clear(bitmap)
+    }
+
+    private suspend fun <T> withInFlightOperation(block: suspend () -> T): T =
+        lifecycleCoordinator.withInFlightOperation(block)
+
+    suspend fun warmUp(context: Context): Unit = withInFlightOperation {
         val appContext = context.applicationContext
         OcrLanguageManager.prepareRuntime(appContext)
         engineMutex.withLock {
             val activePack = OcrLanguageManager.getActivePack(appContext)
-            ensureEngine(appContext, activePack)
+            client(appContext).warmUp(activePack.id)
+            cachedPackId = activePack.id
         }
         Log.d(TAG, "PaddleOCR warm-up complete")
     }
@@ -99,13 +117,13 @@ object PaddleOcrEngine {
      */
     internal suspend fun detachAndReleaseEngine() {
         check(engineMutex.isLocked) { "detachAndReleaseEngine requires engineMutex to be held" }
-        val engine = cachedEngine
-        cachedEngine = null
+        val engine = processClient
+        processClient = null
         cachedPackId = null
-        clearTextCache()
+        textCache.clear()
         if (engine != null) {
             withContext(NonCancellable + Dispatchers.IO) {
-                engine.release()
+                engine.close()
             }
         }
     }
@@ -120,39 +138,43 @@ object PaddleOcrEngine {
         context: Context,
         bitmap: Bitmap,
         includeQrCodes: Boolean = true,
-    ): ExtractionResult = coroutineScope {
-        require(!bitmap.isRecycled) { "Cannot run OCR on a recycled bitmap" }
-        require(bitmap.width > 0 && bitmap.height > 0) { "Cannot run OCR on an empty bitmap" }
+    ): ExtractionResult = withInFlightOperation {
+        val cacheGeneration = textCache.begin(bitmap)
+        coroutineScope {
+            require(!bitmap.isRecycled) { "Cannot run OCR on a recycled bitmap" }
+            require(bitmap.width > 0 && bitmap.height > 0) { "Cannot run OCR on an empty bitmap" }
 
-        val qrDeferred = if (includeQrCodes) {
-            async(Dispatchers.Default) {
-                QrScanner.scanBitmapAll(bitmap).lastOrNull().orEmpty()
-            }
-        } else {
-            null
-        }
-
-        val textNodes = recognizeFullScreen(
-            context = context.applicationContext,
-            bitmap = bitmap,
-        )
-        val textEntitiesDeferred = async(Dispatchers.Default) {
-            extractSmartEntities(textNodes)
-        }
-        val qrCodes = qrDeferred?.await().orEmpty()
-        ExtractionResult(
-            textNodes = textNodes,
-            smartEntities = textEntitiesDeferred.await() + qrCodes.mapNotNull { qr ->
-                qr.bounds?.let { bounds ->
-                    SmartEntity.QrCode(
-                        qrResult = qr.result,
-                        rawText = qr.rawText,
-                        bounds = bounds,
-                        format = qr.format,
-                    )
+            val qrDeferred = if (includeQrCodes) {
+                async(Dispatchers.Default) {
+                    QrScanner.scanBitmapAll(bitmap).lastOrNull().orEmpty()
                 }
-            },
-        )
+            } else {
+                null
+            }
+
+            val textNodes = recognizeFullScreen(
+                context = context.applicationContext,
+                bitmap = bitmap,
+                cacheGeneration = cacheGeneration,
+            )
+            val textEntitiesDeferred = async(Dispatchers.Default) {
+                extractSmartEntities(textNodes)
+            }
+            val qrCodes = qrDeferred?.await().orEmpty()
+            ExtractionResult(
+                textNodes = textNodes,
+                smartEntities = textEntitiesDeferred.await() + qrCodes.mapNotNull { qr ->
+                    qr.bounds?.let { bounds ->
+                        SmartEntity.QrCode(
+                            qrResult = qr.result,
+                            rawText = qr.rawText,
+                            bounds = bounds,
+                            format = qr.format,
+                        )
+                    }
+                },
+            )
+        }
     }
 
     /** Runs a higher-resolution OCR pass while keeping returned bounds in source-bitmap pixels. */
@@ -160,66 +182,69 @@ object PaddleOcrEngine {
         context: Context,
         bitmap: Bitmap,
         sourceRegion: RectF,
-    ): List<TextNode> = withContext(Dispatchers.Default) {
-        require(!bitmap.isRecycled) { "Cannot run OCR on a recycled bitmap" }
-        if (!sourceRegion.isFinite()) return@withContext emptyList()
+    ): List<TextNode> = withInFlightOperation {
+        withContext(Dispatchers.Default) {
+            require(!bitmap.isRecycled) { "Cannot run OCR on a recycled bitmap" }
+            if (!sourceRegion.isFinite()) return@withContext emptyList()
 
-        val appContext = context.applicationContext
-        OcrLanguageManager.prepareRuntime(appContext)
+            val appContext = context.applicationContext
+            OcrLanguageManager.prepareRuntime(appContext)
 
-        val clipped = Rect(
-            floor(sourceRegion.left.toDouble()).toInt().coerceIn(0, bitmap.width),
-            floor(sourceRegion.top.toDouble()).toInt().coerceIn(0, bitmap.height),
-            ceil(sourceRegion.right.toDouble()).toInt().coerceIn(0, bitmap.width),
-            ceil(sourceRegion.bottom.toDouble()).toInt().coerceIn(0, bitmap.height),
-        )
-        if (clipped.width() < 4 || clipped.height() < 4) return@withContext emptyList()
-
-        val sourceArea = clipped.width().toDouble() * clipped.height().toDouble()
-        val scaleByArea = sqrt(2_500_000.0 / sourceArea).toFloat()
-        val scaleByDimension = 2400f / maxOf(clipped.width(), clipped.height())
-        val scale = minOf(2.25f, scaleByArea, scaleByDimension)
-        val targetWidth = (clipped.width() * scale).roundToInt().coerceAtLeast(1)
-        val targetHeight = (clipped.height() * scale).roundToInt().coerceAtLeast(1)
-        val targetedBitmap = Bitmap.createBitmap(
-            targetWidth,
-            targetHeight,
-            Bitmap.Config.ARGB_8888,
-        )
-
-        try {
-            Canvas(targetedBitmap).drawBitmap(
-                bitmap,
-                clipped,
-                Rect(0, 0, targetWidth, targetHeight),
-                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
+            val clipped = Rect(
+                floor(sourceRegion.left.toDouble()).toInt().coerceIn(0, bitmap.width),
+                floor(sourceRegion.top.toDouble()).toInt().coerceIn(0, bitmap.height),
+                ceil(sourceRegion.right.toDouble()).toInt().coerceIn(0, bitmap.width),
+                ceil(sourceRegion.bottom.toDouble()).toInt().coerceIn(0, bitmap.height),
             )
-            engineMutex.withLock {
-                val activePack = OcrLanguageManager.getActivePack(appContext)
-                val activePackId = activePack.id
-                if (cachedPackId != null && cachedPackId != activePackId) {
-                    detachAndReleaseEngine()
-                }
-                val runResult = recognizeLocked(appContext, targetedBitmap, activePack)
-                logTiming("region", runResult.totalTimeMs, runResult.lineCount)
-                mapResultsToTextNodes(
-                    results = runResult.results,
-                    sourceWidth = bitmap.width,
-                    sourceHeight = bitmap.height,
-                    scaleX = 1f / scale,
-                    scaleY = 1f / scale,
-                    offsetX = clipped.left.toFloat(),
-                    offsetY = clipped.top.toFloat(),
+            if (clipped.width() < 4 || clipped.height() < 4) return@withContext emptyList()
+
+            val sourceArea = clipped.width().toDouble() * clipped.height().toDouble()
+            val scaleByArea = sqrt(2_500_000.0 / sourceArea).toFloat()
+            val scaleByDimension = 2400f / maxOf(clipped.width(), clipped.height())
+            val scale = minOf(2.25f, scaleByArea, scaleByDimension)
+            val targetWidth = (clipped.width() * scale).roundToInt().coerceAtLeast(1)
+            val targetHeight = (clipped.height() * scale).roundToInt().coerceAtLeast(1)
+            val targetedBitmap = Bitmap.createBitmap(
+                targetWidth,
+                targetHeight,
+                Bitmap.Config.ARGB_8888,
+            )
+
+            try {
+                Canvas(targetedBitmap).drawBitmap(
+                    bitmap,
+                    clipped,
+                    Rect(0, 0, targetWidth, targetHeight),
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
                 )
+                engineMutex.withLock {
+                    val activePack = OcrLanguageManager.getActivePack(appContext)
+                    val activePackId = activePack.id
+                    if (cachedPackId != null && cachedPackId != activePackId) {
+                        detachAndReleaseEngine()
+                    }
+                    val runResult = recognizeLocked(appContext, targetedBitmap, activePack)
+                    logTiming("region", runResult.totalTimeMs, runResult.lineCount)
+                    mapResultsToTextNodes(
+                        results = runResult.results,
+                        sourceWidth = bitmap.width,
+                        sourceHeight = bitmap.height,
+                        scaleX = 1f / scale,
+                        scaleY = 1f / scale,
+                        offsetX = clipped.left.toFloat(),
+                        offsetY = clipped.top.toFloat(),
+                    )
+                }
+            } finally {
+                targetedBitmap.recycle()
             }
-        } finally {
-            targetedBitmap.recycle()
         }
     }
 
     private suspend fun recognizeFullScreen(
         context: Context,
         bitmap: Bitmap,
+        cacheGeneration: Long,
     ): List<TextNode> {
         val appContext = context.applicationContext
         OcrLanguageManager.prepareRuntime(appContext)
@@ -229,8 +254,8 @@ object PaddleOcrEngine {
             if (cachedPackId != null && cachedPackId != activePackId) {
                 detachAndReleaseEngine()
             }
-            if (cachedBitmap.get() === bitmap && cachedPackId == activePackId && cachedEngine != null) {
-                cachedTextNodes?.let { return@withLock it }
+            if (cachedPackId == activePackId && processClient != null) {
+                textCache.get(bitmap, cacheGeneration)?.let { return@withLock it }
             }
 
             val runResult = recognizeLocked(appContext, bitmap, activePack)
@@ -242,49 +267,13 @@ object PaddleOcrEngine {
                     sourceHeight = bitmap.height,
                 )
             }
-            cachedBitmap = WeakReference(bitmap)
-            cachedTextNodes = nodes
+            textCache.putIfCurrent(bitmap, cacheGeneration, nodes)
             nodes
         }
     }
 
-    /** Must be called while [engineMutex] is held. */
-    private suspend fun ensureEngine(context: Context, activePack: OcrLanguagePack): PaddleOCR {
-        if (cachedEngine != null && cachedPackId == activePack.id) {
-            return cachedEngine!!
-        }
-        if (cachedEngine != null) {
-            detachAndReleaseEngine()
-        }
-        check(OpenCVUtils.init(context)) { "Unable to initialize OpenCV for PaddleOCR" }
-        val engine = if (activePack.isBundled) {
-            PaddleOCR.create(
-                context = context,
-                config = paddleConfig,
-                engineConfig = EngineConfig(numThreads = 4),
-                detModelAssetPath = DET_MODEL_ASSET,
-                recModelAssetPath = REC_MODEL_ASSET,
-                recConfigAssetPath = REC_CONFIG_ASSET,
-            )
-        } else {
-            val baseDir = context.noBackupFilesDir ?: context.filesDir
-            val storage = OcrLanguageStorage(java.io.File(baseDir, "ocr_models"))
-            val installedFiles = storage.getInstalledModelFiles(activePack.id)
-                ?: throw java.io.FileNotFoundException("Installed model files missing for pack ${activePack.displayName}")
-
-            PaddleOCR.create(
-                context = context,
-                config = paddleConfig,
-                engineConfig = EngineConfig(numThreads = 4),
-                detModelAssetPath = DET_MODEL_ASSET,
-                recModelFile = installedFiles.modelFile,
-                recConfigFile = installedFiles.configFile,
-            )
-        }
-        cachedEngine = engine
-        cachedPackId = activePack.id
-        return engine
-    }
+    private fun client(context: Context): OcrProcessClient =
+        processClient ?: OcrProcessClient(context).also { processClient = it }
 
     /** Must be called while [engineMutex] is held. */
     private suspend fun recognizeLocked(
@@ -292,9 +281,8 @@ object PaddleOcrEngine {
         bitmap: Bitmap,
         activePack: OcrLanguagePack,
     ): OCRRunResult {
-        val engine = ensureEngine(context, activePack)
         return try {
-            engine.recognize(bitmap)
+            client(context).recognize(activePack.id, bitmap).also { cachedPackId = activePack.id }
         } catch (error: CancellationException) {
             throw error
         } catch (error: OCRError.InputTooComplex) {
@@ -310,11 +298,6 @@ object PaddleOcrEngine {
             }
             throw error
         }
-    }
-
-    private fun clearTextCache() {
-        cachedBitmap.clear()
-        cachedTextNodes = null
     }
 
     private fun RectF.isFinite(): Boolean =

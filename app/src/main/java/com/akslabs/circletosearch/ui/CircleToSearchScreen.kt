@@ -533,8 +533,14 @@ fun CircleToSearchScreen(
     // Cache for preloaded URLs to avoid re-uploading/re-generating
     val preloadedUrls = remember { mutableMapOf<SearchEngine, String>() }
     
-    // WebView Cache
-    val webViews = remember { mutableMapOf<SearchEngine, WebView>() }
+    val webViews = remember {
+        SearchTabCache<SearchEngine, WebView, SearchWebViewState>(
+            capacity = 2,
+            save = ::saveSearchWebView,
+            destroy = ::destroySearchWebView,
+        )
+    }
+    var browserGeneration by remember { mutableStateOf(0) }
     
     // Update User Agent dynamically when desktop mode changes for a specific engine
     // This is now handled in the AndroidView update block or individual engine effects
@@ -596,6 +602,35 @@ fun CircleToSearchScreen(
             skipHiddenState = false
         )
     )
+
+    val browserLifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var browserForeground by remember(browserLifecycleOwner) {
+        mutableStateOf(browserLifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED))
+    }
+    val currentBrowserEngine by rememberUpdatedState(selectedEngine)
+    DisposableEffect(browserLifecycleOwner, webViews) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    browserForeground = true
+                    if (scaffoldState.bottomSheetState.currentValue != SheetValue.Hidden) {
+                        webViews[currentBrowserEngine]?.onResume()
+                    }
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    browserForeground = false
+                    webViews.values.forEach { it.onPause() }
+                    webViews.keepOnly(currentBrowserEngine)
+                }
+                else -> Unit
+            }
+        }
+        browserLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            browserLifecycleOwner.lifecycle.removeObserver(observer)
+            webViews.clear()
+        }
+    }
 
     // Drawing State
     val currentPathPoints = remember { mutableStateListOf<Offset>() }
@@ -1466,17 +1501,8 @@ fun CircleToSearchScreen(
                     searchUrl = null
                     preloadedUrls.clear()
                     initializedEngines.clear() // Reset smart loading
-                    // Do NOT destroy webviews here to keep them cached if possible? 
-                    // PROBABLY safer to destroy to avoid stale state from previous searches.
-                    webViews.values.forEach { 
-                        it.stopLoading()
-                        it.clearHistory()
-                        it.loadUrl("about:blank")
-                        (it.parent as? ViewGroup)?.removeView(it)
-                        it.removeAllViews()
-                        it.destroy() 
-                    }
                     webViews.clear()
+                    browserGeneration++
                 }
 
                 val manualSearchBitmap = if (activeFullScreenSearchId == null && isSearching) selectedBitmap else null
@@ -1627,15 +1653,6 @@ fun CircleToSearchScreen(
                     }
                 }
 
-                // Memory Optimization: REMOVED Aggressive Cleanup
-                // User Requirement: "dont refresh tabs when user switch tabs keep them in background"
-                // We keep them alive.
-                /* 
-                LaunchedEffect(selectedEngine) {
-                     // ... (Cleanup logic removed)
-                }
-                */
-
                 Box(modifier = Modifier.fillMaxSize()) {
                     // Show loading only if the SELECTED engine isn't ready or just starting
                     if (isLoading || (preloadedUrls.containsKey(selectedEngine) && !webViews.containsKey(selectedEngine))) {
@@ -1653,25 +1670,7 @@ fun CircleToSearchScreen(
                         }
                     }
 
-                    // Dynamic Settings Update (User Agent etc) - Now handled at top level
-                    // Cleanup on Dispose
-                    DisposableEffect(Unit) {
-                        onDispose {
-                            webViews.values.forEach { 
-                                it.stopLoading()
-                                it.clearHistory()
-                                it.loadUrl("about:blank")
-                                (it.parent as? ViewGroup)?.removeView(it)
-                                it.removeAllViews()
-                                it.destroy() 
-                            }
-                            webViews.clear()
-                        }
-                    }
-
-                    // Keep each visited WebView instance (so tab state/history is
-                    // preserved), but attach only the selected one. Alpha-zero
-                    // AndroidViews still own full-screen Surface/layer/layout work.
+                    // Only the current tab is attached; the cache retains one previous tab.
                     val engine = selectedEngine
                     if (
                         initializedEngines.contains(engine) &&
@@ -1679,16 +1678,17 @@ fun CircleToSearchScreen(
                     ) {
                         val url = preloadedUrls.getValue(engine)
 
-                        DisposableEffect(engine) {
+                        DisposableEffect(engine, browserGeneration) {
+                            val ownedWebView = webViews[engine]
                             onDispose {
-                                webViews[engine]?.let { webView ->
-                                    webView.onPause()
-                                    (webView.parent as? ViewGroup)?.removeView(webView)
+                                if (ownedWebView != null && webViews[engine] === ownedWebView) {
+                                    ownedWebView.onPause()
+                                    (ownedWebView.parent as? ViewGroup)?.removeView(ownedWebView)
                                 }
                             }
                         }
 
-                        androidx.compose.runtime.key(engine) {
+                        androidx.compose.runtime.key(engine, browserGeneration) {
                             AndroidView(
                                 factory = { ctx ->
                                     val swipeRefresh = SwipeRefreshLayout(ctx).apply {
@@ -1697,16 +1697,13 @@ fun CircleToSearchScreen(
                                             ViewGroup.LayoutParams.MATCH_PARENT,
                                         )
                                     }
-                                    val webView = webViews[engine] ?: createWebView(ctx, engine).also {
-                                        if (isDesktop(engine)) {
-                                            it.settings.userAgentString =
-                                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                                                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                                                "Chrome/120.0.0.0 Safari/537.36"
+                                    val webView = webViews.acquire(engine) { saved ->
+                                        createWebView(ctx, engine).apply {
+                                            val restored = saved?.history?.let { restoreState(it) } != null
+                                            if (!restored) loadUrl(saved?.url ?: url)
                                         }
-                                        webViews[engine] = it
-                                        it.loadUrl(url)
                                     }
+                                    if (!browserForeground) webViews.keepOnly(engine)
                                     (webView.parent as? ViewGroup)?.removeView(webView)
                                     swipeRefresh.addView(webView)
                                     swipeRefresh.setOnRefreshListener {
@@ -1725,10 +1722,7 @@ fun CircleToSearchScreen(
                                         }
                                     }
                                     if (webView != null) {
-                                        if (webView.url != url && url != webView.originalUrl) {
-                                            webView.loadUrl(url)
-                                        }
-                                        if (scaffoldState.bottomSheetState.currentValue == SheetValue.Hidden) {
+                                        if (!browserForeground || scaffoldState.bottomSheetState.currentValue == SheetValue.Hidden) {
                                             webView.onPause()
                                         } else {
                                             webView.onResume()

@@ -20,4 +20,5 @@
 <resources>
     <string name="app_name">CircleToSearch</string>
     <string name="translate_by_google">Circlesearch</string>
+    <string name="pinned_image_memory_limit">Pinned images use too much memory. Close an existing pin or wait for saving to finish, then try again.</string>
 </resources>

@@ -61,6 +61,7 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.ui.Alignment
+import com.akslabs.circletosearch.ocr.PaddleOcrEngine
 
 class OverlayActivity : ComponentActivity() {
 
@@ -87,6 +88,7 @@ class OverlayActivity : ComponentActivity() {
     private var screenshotCaptureId = BitmapRepository.NO_CAPTURE_ID
     private var contentGeneration = 0L
     private var cameraLaunchInProgress = false
+    private var ocrSessionLease: PaddleOcrEngine.OcrSessionLease? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0))
@@ -206,6 +208,20 @@ class OverlayActivity : ComponentActivity() {
     }
 
 
+    override fun onStart() {
+        super.onStart()
+        ocrSessionLease = PaddleOcrEngine.acquireSession()
+    }
+
+    override fun onStop() {
+        ocrSessionLease?.close()
+        ocrSessionLease = null
+        if (!isChangingConfigurations) {
+            screenshotBitmap.value?.let(PaddleOcrEngine::clearTextCache)
+        }
+        super.onStop()
+    }
+
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
         android.util.Log.d("CircleToSearch", "OverlayActivity onNewIntent - Resetting state")
@@ -269,6 +285,8 @@ class OverlayActivity : ComponentActivity() {
         copyTextManager.value?.disposeSilently()
         copyTextManager.value = null
         searchModeOverride.value = null
+
+        previousBitmap?.let(PaddleOcrEngine::clearTextCache)
 
         updateAssistToken(intent)
         contentGeneration++
@@ -555,7 +573,11 @@ class OverlayActivity : ComponentActivity() {
         copyTextManager.value?.disposeSilently()
         copyTextManager.value = null
 
+        ocrSessionLease?.close()
+        ocrSessionLease = null
+
         if (isFinishing) {
+            screenshotBitmap.value?.let(PaddleOcrEngine::clearTextCache)
             screenshotBitmap.value?.takeUnless { it.isRecycled }?.let { bitmap ->
                 BitmapRepository.clearIfSame(screenshotCaptureId, bitmap)
             }

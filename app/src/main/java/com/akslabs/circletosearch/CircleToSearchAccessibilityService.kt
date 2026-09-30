@@ -23,7 +23,6 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityButtonController
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
@@ -43,7 +42,6 @@ import android.graphics.Paint
 import android.graphics.BitmapShader
 import android.graphics.Shader
 import android.graphics.Matrix
-import androidx.core.graphics.drawable.toBitmap
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -102,6 +100,7 @@ private class ActiveCaptureRequest(
     val assistantCallback: ((AssistantCaptureResult) -> Unit)?,
 ) {
     val timeoutGeneration = AtomicLong(0L)
+    var warmUpJob: kotlinx.coroutines.Job? = null
 }
 
 class CircleToSearchAccessibilityService : AccessibilityService() {
@@ -110,6 +109,8 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
     private val overlayViews = mutableListOf<View>() // Track all added segment views
     private val pinnedOverlayViews = mutableSetOf<View>()
     private val pinnedActionMenus = mutableSetOf<View>()
+    private val pinnedImageBudget = PinnedImageBudget()
+    private val pinnedImageLeases = mutableMapOf<View, PinnedImageBudget.Lease>()
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var configManager: OverlayConfigurationManager
@@ -187,18 +188,6 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         
         updateBubbleState()
         updateOverlay()
-
-        // Pre-warm PaddleOCR in the service lifetime so the first capture does not pay for
-        // loading OpenCV and both ONNX models.
-        serviceScope.launch {
-            try {
-                com.akslabs.circletosearch.ocr.PaddleOcrEngine.warmUp(this@CircleToSearchAccessibilityService)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (e: Exception) {
-                android.util.Log.e("CircleToSearch", "PaddleOCR warm-up failed", e)
-            }
-        }
     }
     
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -237,7 +226,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             try {
                 windowManager?.updateViewLayout(view, params)
             } catch (_: Exception) {
-                pinnedOverlayViews.remove(view)
+                // Keep ownership until the pin is explicitly removed.
             }
         }
         pinnedActionMenus.toList().forEach { menu ->
@@ -255,7 +244,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             try {
                 windowManager?.updateViewLayout(menu, params)
             } catch (_: Exception) {
-                pinnedActionMenus.remove(menu)
+                // Keep ownership until the menu is explicitly removed.
             }
         }
     }
@@ -925,6 +914,17 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             return CaptureStartResult.UNSUPPORTED
         }
 
+        // A confirmed invocation starts model loading alongside screen capture, never on service connection.
+        request.warmUpJob = serviceScope.launch {
+            try {
+                com.akslabs.circletosearch.ocr.PaddleOcrEngine.warmUp(applicationContext)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // Actual OCR reports failure and can establish a fresh worker connection.
+            }
+        }
+
         armCaptureTimeout(request, ACCESSIBILITY_CAPTURE_TIMEOUT_MS)
 
         return try {
@@ -956,6 +956,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             if (!replacesOlderCapture) return false
             if (!activeCaptureRequest.compareAndSet(current, null)) continue
 
+            current.warmUpJob?.cancel()
             current.timeoutGeneration.incrementAndGet()
             try {
                 current.assistantCallback?.invoke(AssistantCaptureResult.Cancelled)
@@ -1037,6 +1038,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                     AssistantCaptureResult.Success(capturedBitmap),
                                 )
                             } catch (callbackError: Exception) {
+                                request.warmUpJob?.cancel()
                                 capturedBitmap.takeUnless { it.isRecycled }?.recycle()
                                 android.util.Log.e(
                                     "CircleToSearch",
@@ -1087,6 +1089,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                                     sourceBitmap.takeUnless { it.isRecycled }?.recycle()
                                     translatedBitmap?.takeUnless { it.isRecycled }?.recycle()
                                     activeCaptureRequest.compareAndSet(request, null)
+                                    request.warmUpJob?.cancel()
                                     throw error
                                 } catch (e: Exception) {
                                     android.util.Log.e("CircleToSearch", "Translation pipeline failed", e)
@@ -1176,6 +1179,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         errorCode: Int?,
     ) {
         if (!activeCaptureRequest.compareAndSet(request, null)) return
+        request.warmUpJob?.cancel()
         request.timeoutGeneration.incrementAndGet()
         val assistantCallback = request.assistantCallback
         if (assistantCallback != null) {
@@ -1212,6 +1216,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         } catch (error: Exception) {
             BitmapRepository.clearIfSame(bitmap)
             bitmap.takeUnless { it.isRecycled }?.recycle()
+            request.warmUpJob?.cancel()
             android.util.Log.e("CircleToSearch", "Failed to publish captured bitmap", error)
             android.widget.Toast.makeText(
                 this,
@@ -1248,30 +1253,19 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         private val radius = 12f * context.resources.displayMetrics.density
         private var cachedBitmap: Bitmap? = null
         private var cachedShader: BitmapShader? = null
+        var onRelease: (() -> Unit)? = null
 
         override fun setImageBitmap(bm: Bitmap?) {
-            cachedBitmap?.recycle()
-            cachedBitmap = null
-            cachedShader = null
+            // The source can also be used by a pending save/share operation.
+            cachedBitmap = bm
+            cachedShader = bm?.let { BitmapShader(it, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP) }
+            paint.shader = cachedShader
             super.setImageBitmap(bm)
         }
 
         override fun onDraw(canvas: android.graphics.Canvas) {
-            val drawable = drawable ?: return
-
-            if (cachedBitmap == null || cachedShader == null) {
-                cachedBitmap?.recycle()
-                cachedBitmap = try {
-                    drawable.toBitmap()
-                } catch (e: Exception) {
-                    return
-                }
-
-                val shader = BitmapShader(cachedBitmap!!, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-                cachedShader = shader
-            }
-
-            val bitmap = cachedBitmap!!
+            val bitmap = cachedBitmap ?: return
+            if (bitmap.isRecycled) return
 
             // Adjust shader to current view bounds
             matrix.reset()
@@ -1286,15 +1280,38 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         }
 
         fun releaseResources() {
-            cachedBitmap?.recycle()
-            cachedBitmap = null
-            cachedShader = null
+            val release = onRelease
+            onRelease = null
+            release?.invoke()
+            animate().cancel()
+            setOnTouchListener(null)
+            setImageBitmap(null)
         }
     }
 
+    private fun removePinnedMenu(menu: View) {
+        try { windowManager?.removeView(menu) } catch (_: IllegalArgumentException) {}
+        pinnedActionMenus.remove(menu)
+        (menu as? android.view.ViewGroup)?.let { group ->
+            for (i in 0 until group.childCount) group.getChildAt(i).setOnClickListener(null)
+        }
+    }
+
+    private fun removePinnedView(view: View) {
+        try { windowManager?.removeView(view) } catch (_: IllegalArgumentException) {}
+        (view as? RoundedImageView)?.releaseResources()
+        pinnedOverlayViews.remove(view)
+        pinnedImageLeases.remove(view)?.close()
+    }
+
     private fun showPinnedArea(bitmap: Bitmap, rect: android.graphics.Rect) {
-        android.util.Log.d("CircleToSearch", "showPinnedArea called for rect: $rect")
-        
+        val manager = windowManager ?: return
+        if (bitmap.isRecycled) return
+        val lease = pinnedImageBudget.reserve(bitmap.allocationByteCount.toLong()) ?: run {
+            android.widget.Toast.makeText(this, R.string.pinned_image_memory_limit, android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+
         val displayMetrics = resources.displayMetrics
         var screenWidth = displayMetrics.widthPixels
         val screenHeight = displayMetrics.heightPixels
@@ -1403,7 +1420,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 override fun onLongPress(e: MotionEvent) {
                     if (!isDragging) {
                         // Show actions
-                        if (currentMenu == null) {
+                        if (currentMenu?.isAttachedToWindow != true) {
                             showPinnedActions(this@apply, bitmap, params) { menu ->
                                 currentMenu = menu
                             }
@@ -1411,6 +1428,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                     }
                 }
             })
+
+            onRelease = {
+                stopFling()
+                velocityTracker?.recycle()
+                velocityTracker = null
+                currentMenu?.let(::removePinnedMenu)
+                currentMenu = null
+            }
 
             @SuppressLint("ClickableViewAccessibility")
             setOnTouchListener { v, event ->
@@ -1452,8 +1477,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                             isDragging = true
                             // If dragging, dismiss menu
                             currentMenu?.let { menu ->
-                                try { windowManager?.removeView(menu) } catch (_: Exception) {}
-                                pinnedActionMenus.remove(menu)
+                                removePinnedMenu(menu)
                             }
                             currentMenu = null
                         }
@@ -1550,8 +1574,9 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         }
 
         try {
-            windowManager?.addView(pinnedView, params)
+            manager.addView(pinnedView, params)
             pinnedOverlayViews += pinnedView
+            pinnedImageLeases[pinnedView] = lease
             
             // --- Beautiful Pin Animation ---
             pinnedView.scaleX = 0f
@@ -1575,11 +1600,14 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 .start()
                 
         } catch (e: Exception) {
+            removePinnedView(pinnedView)
+            lease.close()
             android.util.Log.e("CircleToSearch", "Failed to add pinned view", e)
         }
     }
 
     private fun showPinnedActions(anchorView: View, bitmap: Bitmap, anchorParams: WindowManager.LayoutParams, onMenuCreated: (View) -> Unit) {
+        if (anchorView !in pinnedOverlayViews) return
         val displayMetrics = resources.displayMetrics
         val iconSize = (44 * displayMetrics.density).toInt()
         val btnPadding = (8 * displayMetrics.density).toInt()
@@ -1639,12 +1667,8 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
 
         // --- Action: Share ---
         menuLayout.addView(createTextActionButton("SHARE") {
-            try {
-                windowManager?.removeView(menuLayout)
-            } catch (_: Exception) {
-                // The share can continue even if the transient menu was already removed.
-            }
-            pinnedActionMenus.remove(menuLayout)
+            val operation = pinnedImageLeases[anchorView]?.retain() ?: return@createTextActionButton
+            removePinnedMenu(menuLayout)
 
             serviceScope.launch {
                 try {
@@ -1689,25 +1713,26 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                         ).show()
                     }
                 }
-            }
+            }.invokeOnCompletion { operation.close() }
         })
 
         // --- Action: Delete ---
         menuLayout.addView(createTextActionButton("DELETE") {
-            try {
-                windowManager?.removeView(anchorView)
-                windowManager?.removeView(menuLayout)
-            } catch (e: Exception) {}
-            pinnedOverlayViews.remove(anchorView)
-            pinnedActionMenus.remove(menuLayout)
+            removePinnedView(anchorView)
         })
 
         // --- Action: Save ---
         val saveBtn = createTextActionButton("SAVE") {
-            val success = ImageUtils.saveToGallery(this@CircleToSearchAccessibilityService, bitmap)
-            android.widget.Toast.makeText(this@CircleToSearchAccessibilityService, if (success) "Saved to Gallery" else "Save failed", android.widget.Toast.LENGTH_SHORT).show()
-            try { windowManager?.removeView(menuLayout) } catch (e: Exception) {}
-            pinnedActionMenus.remove(menuLayout)
+            val operation = pinnedImageLeases[anchorView]?.retain() ?: return@createTextActionButton
+            removePinnedMenu(menuLayout)
+            serviceScope.launch {
+                val success = withContext(Dispatchers.IO) {
+                    ImageUtils.saveToGallery(this@CircleToSearchAccessibilityService, bitmap)
+                }
+                withContext(Dispatchers.Main.immediate) {
+                    android.widget.Toast.makeText(this@CircleToSearchAccessibilityService, if (success) "Saved to Gallery" else "Save failed", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }.invokeOnCompletion { operation.close() }
         }
         // Add spacing only if needed (not on the last item)
         menuLayout.addView(saveBtn)
@@ -1812,6 +1837,7 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
             ) {
                 return
             }
+            request.warmUpJob?.cancel()
             request.timeoutGeneration.incrementAndGet()
             try {
                 callback(AssistantCaptureResult.Cancelled)
@@ -1887,23 +1913,6 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
-    override fun onLowMemory() {
-        super.onLowMemory()
-        serviceScope.launch {
-            com.akslabs.circletosearch.ocr.PaddleOcrEngine.releaseCachedEngine()
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    override fun onTrimMemory(level: Int) {
-        super.onTrimMemory(level)
-        if (level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) {
-            serviceScope.launch {
-                com.akslabs.circletosearch.ocr.PaddleOcrEngine.releaseCachedEngine()
-            }
-        }
-    }
-
     override fun onDestroy() {
         if (instance === this) instanceReference.clear()
         if (accessibilityButtonRegistered) {
@@ -1947,19 +1956,10 @@ class CircleToSearchAccessibilityService : AccessibilityService() {
                 e.printStackTrace()
             }
         }
-        pinnedActionMenus.forEach { view ->
-            try {
-                windowManager?.removeView(view)
-            } catch (_: Exception) {}
-        }
-        pinnedActionMenus.clear()
-        pinnedOverlayViews.forEach { view ->
-            try {
-                windowManager?.removeView(view)
-            } catch (_: Exception) {}
-        }
-        pinnedOverlayViews.clear()
+        pinnedActionMenus.toList().forEach(::removePinnedMenu)
+        pinnedOverlayViews.toList().forEach(::removePinnedView)
         hideBubble()
+        com.akslabs.circletosearch.ocr.PaddleOcrEngine.requestReleaseIfIdle()
         super.onDestroy()
     }
 }
